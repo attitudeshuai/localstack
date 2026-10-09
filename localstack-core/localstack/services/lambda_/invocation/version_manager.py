@@ -1,13 +1,11 @@
-import concurrent.futures
 import logging
 import threading
 import time
 from concurrent.futures import Future
-from concurrent.futures._base import ALL_COMPLETED, CancelledError
+from concurrent.futures._base import CancelledError
 
 from localstack import config
 from localstack.aws.api.lambda_ import (
-    ProvisionedConcurrencyStatusEnum,
     ServiceException,
     State,
     StateReasonCode,
@@ -22,7 +20,6 @@ from localstack.services.lambda_.invocation.lambda_models import (
     FunctionVersion,
     Invocation,
     InvocationResult,
-    ProvisionedConcurrencyState,
     VersionState,
 )
 from localstack.services.lambda_.invocation.logs import LogHandler, LogItem
@@ -30,10 +27,16 @@ from localstack.services.lambda_.invocation.metrics import (
     record_cw_metric_error,
     record_cw_metric_invocation,
 )
+from localstack.services.lambda_.invocation.provisioned_concurrency import (
+    ProvisionedConcurrencyCoordinator,
+    ProvisionedConcurrencyLedger,
+    ProvisionedConcurrencySnapshot,
+    ProvisionedConcurrencyUpdatePolicy,
+)
 from localstack.services.lambda_.invocation.runtime_executor import get_runtime_executor
 from localstack.services.lambda_.ldm import LDMProvisioner
 from localstack.utils.strings import long_uid, to_bytes, truncate
-from localstack.utils.threads import FuncThread, start_thread
+from localstack.utils.threads import start_thread
 
 LOG = logging.getLogger(__name__)
 
@@ -44,13 +47,13 @@ class LambdaVersionManager:
     function_version: FunctionVersion
     function: Function
 
-    # Scale provisioned concurrency up and down
-    provisioning_thread: FuncThread | None
     # Additional guard to prevent scheduling invocation on version during shutdown
     shutdown_event: threading.Event
 
     state: VersionState | None
-    provisioned_state: ProvisionedConcurrencyState | None  # TODO: remove?
+    # Incremental provisioned concurrency scaling: coordination, progress and
+    # unified quota accounting (allocated/ready/in-flight) live in the coordinator
+    provisioned_coordinator: ProvisionedConcurrencyCoordinator
     log_handler: LogHandler
     counting_service: CountingService
     assignment_service: AssignmentService
@@ -65,6 +68,7 @@ class LambdaVersionManager:
         function: Function | None,
         counting_service: CountingService,
         assignment_service: AssignmentService,
+        provisioned_ledger: ProvisionedConcurrencyLedger,
     ):
         self.id = long_uid()
         self.function_arn = function_arn
@@ -75,12 +79,15 @@ class LambdaVersionManager:
         self.log_handler = LogHandler(function_version.config.role, function_version.id.region)
 
         # async
-        self.provisioning_thread = None
         self.shutdown_event = threading.Event()
 
-        # async state
-        self.provisioned_state: ProvisionedConcurrencyState | None = None
-        self.provisioned_state_lock = threading.RLock()
+        self.provisioned_coordinator = ProvisionedConcurrencyCoordinator(
+            qualified_arn=function_arn,
+            version_manager_id=self.id,
+            function_version=function_version,
+            assignment_service=assignment_service,
+            ledger=provisioned_ledger,
+        )
         # https://aws.amazon.com/blogs/compute/coming-soon-expansion-of-aws-lambda-states-to-all-functions/
         self.state: VersionState = VersionState(state=State.Pending)
 
@@ -142,71 +149,44 @@ class LambdaVersionManager:
             state=State.Inactive, code=StateReasonCode.Idle, reason="Shutting down"
         )
         self.shutdown_event.set()
+        # Stop incremental provisioned concurrency scaling before tearing the
+        # environment pool down, so the scaling worker does not race the
+        # wholesale shutdown (in-flight calls on provisioned environments are
+        # interrupted by stop_environments_for_version as before).
+        self.provisioned_coordinator.shutdown()
+        self.provisioned_coordinator.join(timeout=2)
         self.log_handler.stop()
         self.assignment_service.stop_environments_for_version(self.id)
         get_runtime_executor().cleanup_version(self.function_version)  # TODO: make pluggable?
 
     def update_provisioned_concurrency_config(
-        self, provisioned_concurrent_executions: int
+        self,
+        provisioned_concurrent_executions: int,
+        *,
+        qualifier: str | None = None,
+        policy: ProvisionedConcurrencyUpdatePolicy = ProvisionedConcurrencyUpdatePolicy.merge,
     ) -> Future[None]:
+        """Declare a new provisioned concurrency target.
+
+        Only the delta is created or reclaimed; environments already in service
+        are not rebuilt. Declarations arriving while an adjustment is running are
+        merged (default, final target = last declaration) or queued FIFO per
+        ``policy``. The returned Future completes when this declaration settles.
+
+        :param provisioned_concurrent_executions: target count; 0 deprovisions
+        :param qualifier: declared qualifier (version number or alias name)
+        :param policy: merge or queue declarations arriving mid-adjustment
         """
-        TODO: implement update while in progress (see test_provisioned_concurrency test)
-        TODO: loop until diff == 0 and retry to remove/add diff environments
-        TODO: alias routing & allocated (i.e., the status while updating provisioned concurrency)
+        return self.provisioned_coordinator.declare(
+            provisioned_concurrent_executions,
+            qualifier=qualifier or self.function_version.id.qualifier,
+            policy=policy,
+        )
 
-        :param provisioned_concurrent_executions: set to 0 to stop all provisioned environments
-        """
-        with self.provisioned_state_lock:
-            # LocalStack limitation: cannot update provisioned concurrency while another update is in progress
-            if (
-                self.provisioned_state
-                and self.provisioned_state.status == ProvisionedConcurrencyStatusEnum.IN_PROGRESS
-            ):
-                raise ServiceException(
-                    "Updating provisioned concurrency configuration while IN_PROGRESS is not supported yet."
-                )
-
-            if not self.provisioned_state:
-                self.provisioned_state = ProvisionedConcurrencyState()
-
-        def scale_environments(*args, **kwargs) -> None:
-            futures = self.assignment_service.scale_provisioned_concurrency(
-                self.id, self.function_version, provisioned_concurrent_executions
-            )
-            # Wait for all provisioning/de-provisioning tasks to finish using a timeout longer than max Lambda execution
-            concurrent.futures.wait(futures, timeout=20 * 60, return_when=ALL_COMPLETED)
-
-            success_count = 0
-            start_error = None
-            for i, future in enumerate(futures):
-                try:
-                    future.result()
-                    success_count += 1
-                except Exception as e:
-                    start_error = e
-
-            with self.provisioned_state_lock:
-                if provisioned_concurrent_executions == 0:
-                    self.provisioned_state = None
-                else:
-                    # TODO: check whether available changes with active invokes while updating
-                    self.provisioned_state.available = success_count
-                    self.provisioned_state.allocated = success_count
-                    if start_error or success_count < provisioned_concurrent_executions:
-                        self.provisioned_state.status = ProvisionedConcurrencyStatusEnum.FAILED
-                        self.provisioned_state.status_reason = "FUNCTION_ERROR_INIT_FAILURE"
-                        LOG.warning(
-                            "Failed to provision %d/%s environments for function %s. Error: %s",
-                            provisioned_concurrent_executions - success_count,
-                            provisioned_concurrent_executions,
-                            self.function_arn,
-                            start_error,
-                        )
-                    else:
-                        self.provisioned_state.status = ProvisionedConcurrencyStatusEnum.READY
-
-        self.provisioning_thread = start_thread(scale_environments)
-        return self.provisioning_thread.result_future
+    def provisioned_snapshot(self) -> ProvisionedConcurrencySnapshot | None:
+        """Queryable progress/result of the current provisioned concurrency
+        adjustment, or None if no target has ever been declared."""
+        return self.provisioned_coordinator.snapshot()
 
     # Extract environment handling
 
@@ -274,7 +254,7 @@ class LambdaVersionManager:
             return invocation_result
 
         with self.counting_service.get_invocation_lease(
-            self.function, self.function_version, self.provisioned_state
+            self.function, self.function_version, self.function_arn
         ) as provisioning_type:
             # TODO: potential race condition when changing provisioned concurrency after getting the lease but before
             #   getting an environment

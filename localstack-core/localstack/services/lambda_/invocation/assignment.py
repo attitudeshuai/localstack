@@ -9,6 +9,7 @@ from localstack.services.lambda_.invocation.execution_environment import (
     EnvironmentStartupTimeoutException,
     ExecutionEnvironment,
     InvalidStatusException,
+    RuntimeStatus,
 )
 from localstack.services.lambda_.invocation.executor_endpoint import StatusErrorException
 from localstack.services.lambda_.invocation.lambda_models import (
@@ -155,26 +156,59 @@ class AssignmentService(OtherServiceEndpoint):
         for env in environments_to_stop:
             self.stop_environment(env)
 
-    def scale_provisioned_concurrency(
+    # == Incremental provisioned concurrency primitives ==
+    #
+    # The provisioned concurrency coordinator reconciles the pool towards a
+    # target using only deltas: already-serving environments are never
+    # recreated. Environments are registered in ``self.environments`` in
+    # creation order, which is the declared FIFO order used when reclaiming.
+
+    def provisioned_environments(self, version_manager_id: str) -> list[ExecutionEnvironment]:
+        """Return provisioned environments in declaration (creation) order.
+
+        The per-manager mapping preserves insertion order, and provisioned
+        environments are never reordered, so the filtered mapping order is the
+        FIFO order used by scale-down.
+        """
+        # Materialize before filtering due to concurrent pool modifications.
+        return [
+            env
+            for env in list(self.environments.get(version_manager_id, {}).values())
+            if env.initialization_type == InitializationType.provisioned_concurrency
+        ]
+
+    def count_provisioned_environments(self, version_manager_id: str) -> tuple[int, int, int]:
+        """Count provisioned environments from physical state.
+
+        :return: ``(total, serviceable, in_flight)`` where serviceable
+            environments are READY or INVOKING and in_flight environments are
+            INVOKING. Used as the ground truth to reconcile the quota ledger.
+        """
+        total = 0
+        serviceable = 0
+        in_flight = 0
+        for env in self.provisioned_environments(version_manager_id):
+            total += 1
+            if env.status in (RuntimeStatus.READY, RuntimeStatus.INVOKING):
+                serviceable += 1
+            if env.status == RuntimeStatus.INVOKING:
+                in_flight += 1
+        return total, serviceable, in_flight
+
+    def create_provisioned_environments(
         self,
         version_manager_id: str,
         function_version: FunctionVersion,
-        target_provisioned_environments: int,
-    ) -> list[Future[None]]:
-        current_provisioned_environments = [
-            e
-            for e in self.environments[version_manager_id].values()
-            if e.initialization_type == InitializationType.provisioned_concurrency
-        ]
-        # TODO: refine scaling loop to re-use existing environments instead of re-creating all
-        # current_provisioned_environments_count = len(current_provisioned_environments)
-        # diff = target_provisioned_environments - current_provisioned_environments_count
+        count: int,
+    ) -> list[tuple[ExecutionEnvironment, Future[None]]]:
+        """Register and start ``count`` new provisioned environments.
 
-        # TODO: handle case where no provisioned environment is available during scaling. Does AWS serve on-demand?
-        # Most simple scaling implementation for now:
-        futures = []
-        # 1) Re-create new target
-        for _ in range(target_provisioned_environments):
+        Only the delta is created; existing environments are untouched. The
+        environments are registered in the pool (i.e. allocation slots exist)
+        before the start tasks are submitted, and are returned in FIFO order.
+        """
+        created: list[tuple[ExecutionEnvironment, Future[None]]] = []
+        for _ in range(count):
             execution_environment = ExecutionEnvironment(
                 function_version=function_version,
                 initialization_type=InitializationType.provisioned_concurrency,
@@ -182,13 +216,56 @@ class AssignmentService(OtherServiceEndpoint):
                 version_manager_id=version_manager_id,
             )
             self.environments[version_manager_id][execution_environment.id] = execution_environment
-            futures.append(self.provisioning_pool.submit(execution_environment.start))
-        # 2) Kill all existing
-        for env in current_provisioned_environments:
-            # TODO: think about concurrent updates while deleting a function
-            futures.append(self.provisioning_pool.submit(self.stop_environment, env))
+            future = self.provisioning_pool.submit(execution_environment.start)
+            created.append((execution_environment, future))
+        return created
 
-        return futures
+    def reclaim_provisioned_environment(self, environment: ExecutionEnvironment) -> str:
+        """Reclaim exactly one provisioned environment, FIFO-safe.
+
+        A READY environment is flipped to STOPPED while holding its status
+        lock (so a concurrent ``reserve`` cannot pick it up) and its runtime is
+        stopped afterwards. Environments that already died during startup are
+        discarded from the pool without a stop call.
+
+        :raises InvalidStatusException: if the environment is INVOKING or still
+            STARTING; it must not be reclaimed and the caller waits/retries.
+        :return: ``"stopped"`` when a serviceable environment was stopped, or
+            ``"discarded"`` when a dead slot was removed.
+        """
+        with environment.status_lock:
+            status = environment.status
+            if status == RuntimeStatus.READY:
+                # Flip atomically so concurrent reserve() calls fail to claim.
+                environment.status = RuntimeStatus.STOPPED
+                stop_runtime = True
+            elif status in (
+                RuntimeStatus.STARTUP_FAILED,
+                RuntimeStatus.STARTUP_TIMED_OUT,
+                RuntimeStatus.STOPPED,
+            ):
+                stop_runtime = False
+            else:
+                # INVOKING (in-flight call) or STARTING (concurrent scale-up):
+                # never reclaim; the coordinator waits and retries in order.
+                raise InvalidStatusException(
+                    f"Provisioned environment {environment.id} cannot be reclaimed while"
+                    f" {status}. Current status: {status}"
+                )
+        # Blocking I/O without holding the environment status lock.
+        if stop_runtime:
+            environment.runtime_executor.stop()
+            if environment.keepalive_timer is not None:
+                environment.keepalive_timer.cancel()
+        self.environments.get(environment.version_manager_id, {}).pop(environment.id, None)
+        return "stopped" if stop_runtime else "discarded"
+
+    def discard_provisioned_environment(self, environment: ExecutionEnvironment) -> None:
+        """Remove a provisioned environment from the pool without stopping it.
+
+        Used during scale-up rollback for environments whose startup failed.
+        """
+        self.environments.get(environment.version_manager_id, {}).pop(environment.id, None)
 
     def stop(self):
         self.provisioning_pool.shutdown(cancel_futures=True)

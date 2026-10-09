@@ -40,7 +40,6 @@ from localstack.aws.api.lambda_ import (
     LastUpdateStatus,
     LoggingConfig,
     PackageType,
-    ProvisionedConcurrencyStatusEnum,
     RecursiveLoop,
     Runtime,
     RuntimeVersionConfig,
@@ -390,18 +389,6 @@ class FunctionUrlConfig:
 class ProvisionedConcurrencyConfiguration:
     provisioned_concurrent_executions: int
     last_modified: str  # date
-
-
-@dataclasses.dataclass
-class ProvisionedConcurrencyState:
-    """transient items"""
-
-    allocated: int = 0
-    available: int = 0
-    status: ProvisionedConcurrencyStatusEnum = dataclasses.field(
-        default=ProvisionedConcurrencyStatusEnum.IN_PROGRESS
-    )
-    status_reason: str | None = None
 
 
 @dataclasses.dataclass

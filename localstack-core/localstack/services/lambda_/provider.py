@@ -381,7 +381,8 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
 
                             manager = self.lambda_service.get_lambda_version_manager(fn_arn)
                             manager.update_provisioned_concurrency_config(
-                                provisioned_config.provisioned_concurrent_executions
+                                provisioned_config.provisioned_concurrent_executions,
+                                qualifier=provisioned_qualifier,
                             )
                         except Exception:
                             LOG.warning(
@@ -3312,6 +3313,26 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
 
         return fn.provisioned_concurrency_configs.get(qualifier)
 
+    @staticmethod
+    def _provisioned_status_fields(
+        ver_manager,
+    ) -> tuple[int, int, ProvisionedConcurrencyStatusEnum, str | None]:
+        """Map the coordinator's queryable progress/result to API fields.
+
+        A manager without any declared adjustment reports the same initial
+        fields as PutProvisionedConcurrencyConfig: IN_PROGRESS with zero
+        allocated/available capacity.
+        """
+        snapshot = ver_manager.provisioned_snapshot()
+        if snapshot is None:
+            return 0, 0, ProvisionedConcurrencyStatusEnum.IN_PROGRESS, None
+        return (
+            snapshot.available,
+            snapshot.allocated,
+            snapshot.status,
+            snapshot.status_reason,
+        )
+
     def put_provisioned_concurrency_config(
         self,
         context: RequestContext,
@@ -3338,12 +3359,6 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
         fn = state.functions.get(function_name)
 
         provisioned_config = self._get_provisioned_config(context, function_name, qualifier)
-
-        if provisioned_config:  # TODO: merge?
-            # TODO: add a test for partial updates (if possible)
-            LOG.warning(
-                "Partial update of provisioned concurrency config is currently not supported."
-            )
 
         other_provisioned_sum = sum(
             [
@@ -3422,8 +3437,10 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
 
         fn.provisioned_concurrency_configs[qualifier] = provisioned_config
 
+        # Incremental adjustment: declarations while IN_PROGRESS are merged
+        # (final target = last declaration) instead of being rejected.
         manager.update_provisioned_concurrency_config(
-            provisioned_config.provisioned_concurrent_executions
+            provisioned_config.provisioned_concurrent_executions, qualifier=qualifier
         )
 
         return PutProvisionedConcurrencyConfigResponse(
@@ -3431,7 +3448,6 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
             AvailableProvisionedConcurrentExecutions=0,
             AllocatedProvisionedConcurrentExecutions=0,
             Status=ProvisionedConcurrencyStatusEnum.IN_PROGRESS,
-            # StatusReason=manager.provisioned_state.status_reason,
             LastModified=provisioned_config.last_modified,  # TODO: does change with configuration or also with state changes?
         )
 
@@ -3466,14 +3482,15 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
             fn_arn = api_utils.qualified_lambda_arn(function_name, qualifier, account_id, region)
 
         ver_manager = self.lambda_service.get_lambda_version_manager(fn_arn)
+        available, allocated, status, status_reason = self._provisioned_status_fields(ver_manager)
 
         return GetProvisionedConcurrencyConfigResponse(
             RequestedProvisionedConcurrentExecutions=provisioned_config.provisioned_concurrent_executions,
             LastModified=provisioned_config.last_modified,
-            AvailableProvisionedConcurrentExecutions=ver_manager.provisioned_state.available,
-            AllocatedProvisionedConcurrentExecutions=ver_manager.provisioned_state.allocated,
-            Status=ver_manager.provisioned_state.status,
-            StatusReason=ver_manager.provisioned_state.status_reason,
+            AvailableProvisionedConcurrentExecutions=available,
+            AllocatedProvisionedConcurrentExecutions=allocated,
+            Status=status,
+            StatusReason=status_reason,
         )
 
     def list_provisioned_concurrency_configs(
@@ -3508,6 +3525,7 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
                 )
 
             manager = self.lambda_service.get_lambda_version_manager(fn_arn)
+            available, allocated, status, status_reason = self._provisioned_status_fields(manager)
 
             configs.append(
                 ProvisionedConcurrencyConfigListItem(
@@ -3515,10 +3533,10 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
                         function_name, qualifier, account_id, region
                     ),
                     RequestedProvisionedConcurrentExecutions=pc_config.provisioned_concurrent_executions,
-                    AvailableProvisionedConcurrentExecutions=manager.provisioned_state.available,
-                    AllocatedProvisionedConcurrentExecutions=manager.provisioned_state.allocated,
-                    Status=manager.provisioned_state.status,
-                    StatusReason=manager.provisioned_state.status_reason,
+                    AvailableProvisionedConcurrentExecutions=available,
+                    AllocatedProvisionedConcurrentExecutions=allocated,
+                    Status=status,
+                    StatusReason=status_reason,
                     LastModified=pc_config.last_modified,
                 )
             )
@@ -3553,9 +3571,19 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
         # delete is idempotent and doesn't actually care about the provisioned concurrency config not existing
         if provisioned_config:
             fn.provisioned_concurrency_configs.pop(qualifier)
-            fn_arn = api_utils.qualified_lambda_arn(function_name, qualifier, account_id, region)
+            if api_utils.qualifier_is_alias(qualifier):
+                # resolve the alias to its physical function version, which is
+                # what version managers and ledger accounts are keyed by
+                alias = fn.aliases.get(qualifier)
+                fn_arn = api_utils.qualified_lambda_arn(
+                    function_name, alias.function_version, account_id, region
+                )
+            else:
+                fn_arn = api_utils.qualified_lambda_arn(
+                    function_name, qualifier, account_id, region
+                )
             manager = self.lambda_service.get_lambda_version_manager(fn_arn)
-            manager.update_provisioned_concurrency_config(0)
+            manager.update_provisioned_concurrency_config(0, qualifier=qualifier)
 
     # =======================================
     # =======  Event Invoke Config   ========

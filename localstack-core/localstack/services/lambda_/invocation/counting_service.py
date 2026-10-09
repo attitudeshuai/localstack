@@ -3,16 +3,21 @@ import logging
 from collections import defaultdict
 from collections.abc import Iterator
 from threading import RLock
+from typing import TYPE_CHECKING
 
 from localstack import config
-from localstack.aws.api.lambda_ import ProvisionedConcurrencyStatusEnum, TooManyRequestsException
+from localstack.aws.api.lambda_ import TooManyRequestsException
 from localstack.services.lambda_.invocation.lambda_models import (
     Function,
     FunctionVersion,
     InitializationType,
-    ProvisionedConcurrencyState,
 )
 from localstack.services.lambda_.invocation.models import lambda_stores
+
+if TYPE_CHECKING:
+    from localstack.services.lambda_.invocation.provisioned_concurrency import (
+        ProvisionedConcurrencyLedger,
+    )
 
 LOG = logging.getLogger(__name__)
 
@@ -72,23 +77,24 @@ class CountingService:
     # Lock for safely initializing new on-demand concurrency trackers
     on_demand_init_lock: RLock
 
-    # (account, region) => ConcurrencyTracker (qualified arn) => concurrent executions
-    provisioned_concurrency_trackers: dict[tuple[str, str], ConcurrencyTracker]
-    # Lock for safely initializing new provisioned concurrency trackers
-    provisioned_concurrency_init_lock: RLock
+    # Unified ledger holding allocated/ready/in-flight provisioned concurrency
+    # accounts per function, alias and physical version.
+    provisioned_ledger: "ProvisionedConcurrencyLedger | None"
 
-    def __init__(self):
+    def __init__(
+        self,
+        provisioned_ledger: "ProvisionedConcurrencyLedger | None" = None,
+    ):
         self.on_demand_concurrency_trackers = {}
         self.on_demand_init_lock = RLock()
-        self.provisioned_concurrency_trackers = {}
-        self.provisioned_concurrency_init_lock = RLock()
+        self.provisioned_ledger = provisioned_ledger
 
     @contextlib.contextmanager
     def get_invocation_lease(
         self,
         function: Function | None,
         function_version: FunctionVersion,
-        provisioned_state: ProvisionedConcurrencyState | None = None,
+        provisioned_qualified_arn: str | None = None,
     ) -> Iterator[InitializationType]:
         """An invocation lease reserves the right to schedule an invocation.
         The returned lease type can either be on-demand or provisioned.
@@ -112,54 +118,41 @@ class CountingService:
                         ConcurrencyTracker()
                     )
 
-        provisioned_tracker = self.provisioned_concurrency_trackers.get(scope_tuple)
-        # Double-checked locking pattern to initialize a provisioned concurrency tracker if it does not exist
-        if not provisioned_tracker:
-            with self.provisioned_concurrency_init_lock:
-                provisioned_tracker = self.provisioned_concurrency_trackers.get(scope_tuple)
-                if not provisioned_tracker:
-                    provisioned_tracker = self.provisioned_concurrency_trackers[scope_tuple] = (
-                        ConcurrencyTracker()
-                    )
-
         unqualified_function_arn = function_version.id.unqualified_arn()
-        qualified_arn = function_version.id.qualified_arn()
+        qualified_arn = provisioned_qualified_arn or function_version.id.qualified_arn()
 
         lease_type = None
+        # Keep the account object returned by the lease grant: the finally block
+        # must decrement on THIS object even if scale-to-zero detached it from
+        # the ledger while the invocation was still running.
+        provisioned_account = None
         # HACK: skip reserved and provisioned concurrency if function not available (e.g., in Lambda@Edge)
-        if function is not None:
-            with provisioned_tracker.lock:
-                # 1) Check for free provisioned concurrency
-                provisioned_concurrency_config = function.provisioned_concurrency_configs.get(
-                    function_version.id.qualifier
-                )
-                if not provisioned_concurrency_config:
-                    # check if any aliases point to the current version, and check the provisioned concurrency config
-                    # for them. There can be only one config for a version, not matter if defined on the alias or version itself.
-                    for alias in function.aliases.values():
-                        if alias.function_version == function_version.id.qualifier:
-                            provisioned_concurrency_config = (
-                                function.provisioned_concurrency_configs.get(alias.name)
-                            )
-                            break
-                # Favor provisioned concurrency if configured and ready
-                # TODO: test updating provisioned concurrency? Does AWS serve on-demand during updates?
-                # Potential challenge if an update happens in between reserving the lease here and actually assigning
-                # * Increase provisioned: It could happen that we give a lease for provisioned-concurrency although
-                # brand new provisioned environments are not yet initialized.
-                # * Decrease provisioned: It could happen that we have running invocations that should still be counted
-                # against the limit but they are not because we already updated the concurrency config to fewer envs.
-                if (
-                    provisioned_concurrency_config
-                    and provisioned_state.status == ProvisionedConcurrencyStatusEnum.READY
-                ):
-                    available_provisioned_concurrency = (
-                        provisioned_concurrency_config.provisioned_concurrent_executions
-                        - provisioned_tracker.concurrent_executions[qualified_arn]
-                    )
-                    if available_provisioned_concurrency > 0:
-                        provisioned_tracker.increment(qualified_arn)
-                        lease_type = InitializationType.provisioned_concurrency
+        if function is not None and self.provisioned_ledger is not None:
+            # 1) Check for free provisioned concurrency
+            provisioned_concurrency_config = function.provisioned_concurrency_configs.get(
+                function_version.id.qualifier
+            )
+            if not provisioned_concurrency_config:
+                # check if any aliases point to the current version, and check the provisioned concurrency config
+                # for them. There can be only one config for a version, not matter if defined on the alias or version itself.
+                for alias in function.aliases.values():
+                    if alias.function_version == function_version.id.qualifier:
+                        provisioned_concurrency_config = (
+                            function.provisioned_concurrency_configs.get(alias.name)
+                        )
+                        break
+            # Favor provisioned concurrency if configured and ready. The unified
+            # ledger is the single source of truth for the allocated/ready/
+            # in-flight accounts; the atomic lease grant together with the
+            # scale-down reclaim gate guarantees that scale-down never takes
+            # away the environment of an outstanding (even not-yet-reserved)
+            # provisioned lease.
+            # TODO: test updating provisioned concurrency? Does AWS serve on-demand during updates?
+            if provisioned_concurrency_config:
+                candidate_account = self.provisioned_ledger.get(qualified_arn)
+                if candidate_account is not None and candidate_account.try_acquire_in_flight():
+                    provisioned_account = candidate_account
+                    lease_type = InitializationType.provisioned_concurrency
 
         if not lease_type:
             with on_demand_tracker.lock:
@@ -242,7 +235,11 @@ class CountingService:
             yield lease_type
         finally:
             if lease_type == InitializationType.provisioned_concurrency:
-                provisioned_tracker.atomic_decrement(qualified_arn)
+                # Decrement on the granted account object itself: it may have
+                # been detached from the ledger by a concurrent shutdown, but
+                # the outstanding lease still owns one of its in-flight slots.
+                assert provisioned_account is not None
+                provisioned_account.decrement_in_flight()
             elif lease_type == InitializationType.on_demand:
                 on_demand_tracker.atomic_decrement(unqualified_function_arn)
             else:

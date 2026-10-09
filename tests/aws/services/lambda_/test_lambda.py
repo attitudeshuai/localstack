@@ -3100,6 +3100,162 @@ class TestLambdaConcurrency:
             )
         snapshot.match("reserved_equals_provisioned_increase_provisioned_exc", e.value.response)
 
+    @markers.aws.only_localstack
+    def test_provisioned_concurrency_incremental_adjustment(
+        self, create_lambda_function, aws_client
+    ):
+        """Adjustments only create/reclaim the delta; serving environments stay
+        available throughout successive adjustments."""
+        check_concurrency_quota(aws_client, 10 + 3)
+
+        func_name = f"test_lambda_{short_uid()}"
+        create_lambda_function(
+            func_name=func_name,
+            handler_file=TEST_LAMBDA_INVOCATION_TYPE,
+            runtime=Runtime.python3_12,
+            client=aws_client.lambda_,
+        )
+        v1 = aws_client.lambda_.publish_version(FunctionName=func_name)
+
+        aws_client.lambda_.put_provisioned_concurrency_config(
+            FunctionName=func_name, Qualifier=v1["Version"], ProvisionedConcurrentExecutions=2
+        )
+        assert wait_until(concurrency_update_done(aws_client.lambda_, func_name, v1["Version"]))
+
+        # scale up by the delta; invocations keep being served as provisioned throughout
+        invoke_before = aws_client.lambda_.invoke(FunctionName=func_name, Qualifier=v1["Version"])
+        assert json.load(invoke_before["Payload"]) == "provisioned-concurrency"
+
+        aws_client.lambda_.put_provisioned_concurrency_config(
+            FunctionName=func_name, Qualifier=v1["Version"], ProvisionedConcurrentExecutions=3
+        )
+        assert wait_until(concurrency_update_done(aws_client.lambda_, func_name, v1["Version"]))
+        config_after_up = aws_client.lambda_.get_provisioned_concurrency_config(
+            FunctionName=func_name, Qualifier=v1["Version"]
+        )
+        assert config_after_up["Status"] == "READY"
+        assert config_after_up["AllocatedProvisionedConcurrentExecutions"] == 3
+        assert config_after_up["AvailableProvisionedConcurrentExecutions"] == 3
+
+        invoke_after_up = aws_client.lambda_.invoke(FunctionName=func_name, Qualifier=v1["Version"])
+        assert json.load(invoke_after_up["Payload"]) == "provisioned-concurrency"
+
+        # scale down by the delta keeps the remaining environments serving
+        aws_client.lambda_.put_provisioned_concurrency_config(
+            FunctionName=func_name, Qualifier=v1["Version"], ProvisionedConcurrentExecutions=1
+        )
+        assert wait_until(concurrency_update_done(aws_client.lambda_, func_name, v1["Version"]))
+        config_after_down = aws_client.lambda_.get_provisioned_concurrency_config(
+            FunctionName=func_name, Qualifier=v1["Version"]
+        )
+        assert config_after_down["Status"] == "READY"
+        assert config_after_down["AllocatedProvisionedConcurrentExecutions"] == 1
+        invoke_after_down = aws_client.lambda_.invoke(
+            FunctionName=func_name, Qualifier=v1["Version"]
+        )
+        assert json.load(invoke_after_down["Payload"]) == "provisioned-concurrency"
+
+    @markers.aws.only_localstack
+    def test_provisioned_concurrency_updates_while_in_progress_merge_to_last(
+        self, create_lambda_function, aws_client
+    ):
+        """Repeated declarations during IN_PROGRESS are not rejected; the final
+        target equals the last declaration and progress stays queryable."""
+        check_concurrency_quota(aws_client, 10 + 4)
+
+        func_name = f"test_lambda_{short_uid()}"
+        create_lambda_function(
+            func_name=func_name,
+            handler_file=TEST_LAMBDA_INVOCATION_TYPE,
+            runtime=Runtime.python3_12,
+            client=aws_client.lambda_,
+        )
+        v1 = aws_client.lambda_.publish_version(FunctionName=func_name)
+
+        # three rapid declarations must all be accepted instead of raising
+        aws_client.lambda_.put_provisioned_concurrency_config(
+            FunctionName=func_name, Qualifier=v1["Version"], ProvisionedConcurrentExecutions=4
+        )
+        aws_client.lambda_.put_provisioned_concurrency_config(
+            FunctionName=func_name, Qualifier=v1["Version"], ProvisionedConcurrentExecutions=2
+        )
+        last_put = aws_client.lambda_.put_provisioned_concurrency_config(
+            FunctionName=func_name, Qualifier=v1["Version"], ProvisionedConcurrentExecutions=3
+        )
+        assert last_put["Status"] == "IN_PROGRESS"
+
+        assert wait_until(concurrency_update_done(aws_client.lambda_, func_name, v1["Version"]))
+        final_config = aws_client.lambda_.get_provisioned_concurrency_config(
+            FunctionName=func_name, Qualifier=v1["Version"]
+        )
+        assert final_config["RequestedProvisionedConcurrentExecutions"] == 3
+        assert final_config["AllocatedProvisionedConcurrentExecutions"] == 3
+        assert final_config["AvailableProvisionedConcurrentExecutions"] == 3
+        assert final_config["Status"] == "READY"
+
+    @markers.aws.only_localstack
+    def test_provisioned_concurrency_delete_waits_for_in_flight(
+        self, create_lambda_function, aws_client
+    ):
+        """Deleting provisioned concurrency never interrupts an in-flight call:
+        the busy invocation completes on the provisioned environment, new calls
+        fall back to on-demand, and the config eventually disappears."""
+        check_concurrency_quota(aws_client, 10 + 2)
+
+        func_name = f"test_lambda_{short_uid()}"
+        create_lambda_function(
+            func_name=func_name,
+            handler_file=TEST_LAMBDA_INVOCATION_TYPE,
+            runtime=Runtime.python3_12,
+            client=aws_client.lambda_,
+        )
+        v1 = aws_client.lambda_.publish_version(FunctionName=func_name)
+        aws_client.lambda_.put_provisioned_concurrency_config(
+            FunctionName=func_name, Qualifier=v1["Version"], ProvisionedConcurrentExecutions=2
+        )
+        assert wait_until(concurrency_update_done(aws_client.lambda_, func_name, v1["Version"]))
+
+        long_result = {}
+        errored = False
+
+        def _long_invoke():
+            nonlocal errored
+            try:
+                result = aws_client.lambda_.invoke(
+                    FunctionName=func_name,
+                    Qualifier=v1["Version"],
+                    Payload=json.dumps({"wait": 8}),
+                )
+                long_result["init_type"] = json.load(result["Payload"])
+            except Exception:
+                LOG.exception("Long-running provisioned invoke failed")
+                errored = True
+
+        thread = threading.Thread(target=_long_invoke)
+        thread.start()
+        # ensure the provisioned environment picked up the long invocation
+        time.sleep(2)
+
+        # deletion while the call is in flight must not raise and not kill it
+        aws_client.lambda_.delete_provisioned_concurrency_config(
+            FunctionName=func_name, Qualifier=v1["Version"]
+        )
+
+        # the config is gone, so new invocations cannot be scheduled provisioned
+        invoke_fallback = aws_client.lambda_.invoke(FunctionName=func_name, Qualifier=v1["Version"])
+        assert json.load(invoke_fallback["Payload"]) == "on-demand"
+
+        thread.join()
+        assert not errored
+        assert long_result["init_type"] == "provisioned-concurrency"
+
+        with pytest.raises(
+            aws_client.lambda_.exceptions.ProvisionedConcurrencyConfigNotFoundException
+        ):
+            aws_client.lambda_.get_provisioned_concurrency_config(
+                FunctionName=func_name, Qualifier=v1["Version"]
+            )
+
 
 class TestLambdaVersions:
     @markers.aws.validated

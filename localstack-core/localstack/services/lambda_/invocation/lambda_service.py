@@ -57,6 +57,9 @@ from localstack.services.lambda_.invocation.lambda_models import (
     VersionState,
 )
 from localstack.services.lambda_.invocation.models import LambdaStore, lambda_stores
+from localstack.services.lambda_.invocation.provisioned_concurrency import (
+    ProvisionedConcurrencyLedger,
+)
 from localstack.services.lambda_.invocation.version_manager import LambdaVersionManager
 from localstack.services.lambda_.lambda_utils import HINT_LOG
 from localstack.utils.archives import get_unzipped_size, is_zip_file
@@ -84,6 +87,7 @@ class LambdaService:
 
     assignment_service: AssignmentService
     counting_service: CountingService
+    provisioned_ledger: ProvisionedConcurrencyLedger
 
     def __init__(self) -> None:
         self.lambda_running_versions = {}
@@ -92,7 +96,8 @@ class LambdaService:
         self.lambda_version_manager_lock = RLock()
         self.task_executor = ThreadPoolExecutor(thread_name_prefix="lambda-service-task")
         self.assignment_service = AssignmentService()
-        self.counting_service = CountingService()
+        self.provisioned_ledger = ProvisionedConcurrencyLedger()
+        self.counting_service = CountingService(provisioned_ledger=self.provisioned_ledger)
 
     def stop(self) -> None:
         """
@@ -188,6 +193,7 @@ class LambdaService:
                 function=fn,
                 counting_service=self.counting_service,
                 assignment_service=self.assignment_service,
+                provisioned_ledger=self.provisioned_ledger,
             )
             self.lambda_starting_versions[qualified_arn] = version_manager
             lambda_hooks.create_function_version.run(function_version.qualified_arn)
@@ -291,6 +297,7 @@ class LambdaService:
                 function=fn,
                 counting_service=self.counting_service,
                 assignment_service=self.assignment_service,
+                provisioned_ledger=self.provisioned_ledger,
             )
             self.lambda_starting_versions[qualified_arn] = version_manager
         self._start_lambda_version(version_manager)
@@ -624,11 +631,15 @@ class LambdaService:
             vm_new = self.get_lambda_version_manager(function_arn=fn_version_new.qualified_arn)
 
             # TODO: we might need to pull provisioned concurrency state a bit more out of the version manager for get_provisioned_concurrency_config
-            # TODO: make this fully async
-            vm_old.update_provisioned_concurrency_config(0).result(timeout=4)  # sync
+            # Both adjustments are incremental and non-blocking: the old version
+            # drains in FIFO order and waits for in-flight calls to finish before
+            # reclaiming its environments (busy environments must not be stopped),
+            # while the new version starts provisioning concurrently.
+            vm_old.update_provisioned_concurrency_config(0, qualifier=old_alias.name)
             vm_new.update_provisioned_concurrency_config(
-                provisioned_concurrency_config.provisioned_concurrent_executions
-            )  # async again
+                provisioned_concurrency_config.provisioned_concurrent_executions,
+                qualifier=new_alias.name,
+            )
 
     def can_assume_role(self, role_arn: str, region: str) -> bool:
         """
