@@ -3,6 +3,7 @@ from collections.abc import Callable
 from typing import Any
 
 from localstack.runtime import hooks
+from localstack.services.plugins import ServiceState
 from localstack.utils.functions import call_safe
 
 LOG = logging.getLogger(__name__)
@@ -66,7 +67,21 @@ def shutdown_services():
     from localstack.services.plugins import SERVICE_PLUGINS
 
     LOG.info("[shutdown] Stopping all services")
-    SERVICE_PLUGINS.stop_all_services()
+    results = SERVICE_PLUGINS.stop_all_services()
+
+    interrupted_requests = sum(result.interrupted_requests for result in results)
+    if interrupted_requests:
+        LOG.warning(
+            "[shutdown] Force-stopped %d in-flight request(s) that did not finish within the drain timeout",
+            interrupted_requests,
+        )
+
+    failed_stops = [result.service for result in results if result.state == ServiceState.ERROR]
+    if failed_stops:
+        LOG.warning(
+            "[shutdown] The following services could not be stopped cleanly: %s",
+            ", ".join(failed_stops),
+        )
 
 
 @hooks.on_infra_shutdown(priority=SERVICE_SHUTDOWN_PRIORITY - 10)

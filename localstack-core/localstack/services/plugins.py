@@ -5,8 +5,9 @@ import threading
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol
+from typing import Any, Protocol
 
 from plux import Plugin, PluginLifecycleListener, PluginManager, PluginSpec
 
@@ -18,7 +19,7 @@ from localstack.runtime import hooks
 from localstack.state import StateLifecycleHook, StateVisitable, StateVisitor
 from localstack.utils.bootstrap import get_enabled_apis, is_api_enabled, log_duration
 from localstack.utils.functions import call_safe
-from localstack.utils.sync import SynchronizedDefaultDict, poll_condition
+from localstack.utils.sync import SynchronizedDefaultDict
 
 # set up logger
 LOG = logging.getLogger(__name__)
@@ -44,6 +45,19 @@ class ServiceDisabled(ServiceException):
 
 class ServiceStateException(ServiceException):
     pass
+
+
+class IllegalServiceStateTransition(ServiceStateException):
+    """Raised when a requested lifecycle state transition is not allowed by the state machine. The
+    entire operation is rejected: the service remains in its current state, and no side effects occur."""
+
+    def __init__(self, service_name: str, current: "ServiceState", target: "ServiceState") -> None:
+        super().__init__(
+            f"illegal state transition for service {service_name}: {current.value} -> {target.value}"
+        )
+        self.service_name = service_name
+        self.current_state = current
+        self.target_state = target
 
 
 class ServiceLifecycleHook(StateLifecycleHook):
@@ -183,9 +197,119 @@ class ServiceState(Enum):
     ERROR = "error"
 
 
+# time (in seconds) callers wait for an in-progress start/stop before giving up
+SERVICE_START_WAIT_TIMEOUT = 30.0
+# time (in seconds) a stop waits for in-flight requests to finish before force-stopping the service
+SERVICE_STOP_DRAIN_TIMEOUT = 5.0
+
+
+# Legal transitions of the service lifecycle state machine. This table is the single source of truth
+# shared by the service containers, the service manager, the request handler chain and the shutdown
+# hooks. Any transition that is not listed here is rejected as a whole (no partial state change).
+SERVICE_STATE_TRANSITIONS: dict[ServiceState, frozenset[ServiceState]] = {
+    ServiceState.UNKNOWN: frozenset({ServiceState.AVAILABLE, ServiceState.DISABLED}),
+    ServiceState.AVAILABLE: frozenset({ServiceState.STARTING, ServiceState.DISABLED}),
+    ServiceState.DISABLED: frozenset(),
+    ServiceState.STARTING: frozenset(
+        {ServiceState.RUNNING, ServiceState.AVAILABLE, ServiceState.ERROR}
+    ),
+    ServiceState.RUNNING: frozenset({ServiceState.STOPPING, ServiceState.ERROR}),
+    ServiceState.STOPPING: frozenset({ServiceState.STOPPED, ServiceState.ERROR}),
+    ServiceState.STOPPED: frozenset({ServiceState.STARTING, ServiceState.DISABLED}),
+    ServiceState.ERROR: frozenset({ServiceState.AVAILABLE, ServiceState.DISABLED}),
+}
+
+
+def can_transition(current: ServiceState, target: ServiceState) -> bool:
+    return target in SERVICE_STATE_TRANSITIONS.get(current, frozenset())
+
+
+def is_startable(state: ServiceState) -> bool:
+    return can_transition(state, ServiceState.STARTING)
+
+
+def is_stoppable(state: ServiceState) -> bool:
+    return can_transition(state, ServiceState.STOPPING)
+
+
+def is_terminal(state: ServiceState) -> bool:
+    return not SERVICE_STATE_TRANSITIONS.get(state, frozenset())
+
+
+def is_servable(state: ServiceState) -> bool:
+    return state == ServiceState.RUNNING
+
+
+@dataclass
+class LifecyclePhase:
+    """
+    A declared assembly phase. ``action`` executes the phase; ``rollback`` (if declared) reverses the
+    effects of a completed phase when a later phase fails.
+    """
+
+    name: str
+    action: Callable[[], Any]
+    rollback: Callable[[], Any] | None = None
+
+
+@dataclass
+class ServiceFailure:
+    """
+    Explains an ``ERROR`` state: the phase during which assembly or shutdown failed, the captured error,
+    and the names of the phases that have been rolled back (in rollback execution order).
+    """
+
+    phase: str
+    error: Exception
+    rolled_back_phases: list[str]
+    message: str
+
+    def __str__(self) -> str:
+        return self.message
+
+
+@dataclass
+class ServiceStopResult:
+    """Result of a stop attempt."""
+
+    service: str
+    state: ServiceState
+    interrupted_requests: int = 0
+    drained: bool = True
+    error: Exception | None = None
+
+    @property
+    def stopped(self) -> bool:
+        return self.state == ServiceState.STOPPED
+
+
+class _PhaseFailure(Exception):
+    """Internal signal that an assembly phase raised. Carries index, phase name and original error."""
+
+    def __init__(self, index: int, phase: str, error: Exception) -> None:
+        super().__init__(str(error))
+        self.index = index
+        self.phase = phase
+        self.error = error
+
+
 class ServiceContainer:
     """
     Holds a service, its state, and exposes lifecycle methods of the service.
+
+    The container implements a reentrant, rollback-capable lifecycle state machine:
+
+      * State transitions are validated against ``SERVICE_STATE_TRANSITIONS``. Illegal transitions raise
+        ``IllegalServiceStateTransition`` and leave the container completely untouched.
+      * Assembly is single-flight: concurrent ``assemble()`` calls for the same service trigger exactly
+        one assembly; all other callers block on the container condition and share the outcome (either
+        the running service or the very same captured error).
+      * If an assembly phase fails, all completed phases are rolled back in reverse declaration order
+        and the container settles in an explainable ``ERROR`` state (see ``ServiceFailure``). The only
+        ways out are ``retry()`` (re-assemble, bringing the service back to ``RUNNING``) or
+        ``deactivate()`` (permanently ``DISABLED``).
+      * ``stop()`` drains in-flight requests, invokes the service stop function, and reports the number
+        of requests that were still in flight when the drain timeout was reached.
     """
 
     service: Service
@@ -197,41 +321,404 @@ class ServiceContainer:
         self.service = service
         self.state = state
         self.lock = threading.RLock()
+        self.condition = threading.Condition(self.lock)
         self.errors = []
+        self.failure: ServiceFailure | None = None
+        self.inflight_requests = 0
+        self._request_generation = 0
+        self._phases: list[LifecyclePhase] | None = None
 
     def get(self) -> Service:
         return self.service
 
-    def start(self) -> bool:
-        try:
-            self.state = ServiceState.STARTING
-            self.service.start(asynchronous=True)
-        except Exception as e:
-            self.state = ServiceState.ERROR
-            self.errors.append(e)
-            LOG.error("error while starting service %s: %s", self.service.name(), e)
-            return False
-        return self.check()
+    # ------------------------------------------------------------------
+    # state machine primitives
+    # ------------------------------------------------------------------
+
+    def _transition(self, target: ServiceState) -> None:
+        """Transition to ``target``. Must be called while holding ``self.condition``."""
+        current = self.state
+        if current == target:
+            return
+        if not can_transition(current, target):
+            raise IllegalServiceStateTransition(self.service.name(), current, target)
+        LOG.debug(
+            "service %s state transition: %s -> %s",
+            self.service.name(),
+            current.value,
+            target.value,
+        )
+        self.state = target
+
+    def _capture_failure(
+        self, phase: str, error: Exception, rolled_back_phases: list[str]
+    ) -> ServiceFailure:
+        """Must be called while holding ``self.condition``."""
+        failure = ServiceFailure(
+            phase=phase,
+            error=error,
+            rolled_back_phases=rolled_back_phases,
+            message=(
+                f"service {self.service.name()} failed in phase '{phase}': {error}; "
+                f"rolled back phases: {rolled_back_phases or '<none>'}"
+            ),
+        )
+        self.errors.append(error)
+        self.failure = failure
+        return failure
+
+    def _failure_exception(self) -> Exception:
+        if self.failure is not None:
+            return self.failure.error
+        if self.errors:
+            return self.errors[-1]
+        return ServiceStateException(
+            f"service {self.service.name()} is in error state without a captured error"
+        )
+
+    # ------------------------------------------------------------------
+    # assembly phases
+    # ------------------------------------------------------------------
+
+    def _build_phases(self) -> list[LifecyclePhase]:
+        """
+        Declares the assembly phases in declaration order. These invoke the exact same callables, in the
+        exact same order and with the exact same keyword arguments as the previous (linear) startup path
+        ``Service.start(asynchronous=True)`` followed by ``Service.check(print_error=True)``.
+        """
+        phases = [
+            LifecyclePhase(
+                name="before_start",
+                action=lambda: call_safe(self.service.lifecycle_hook.on_before_start),
+            )
+        ]
+
+        start_function = self.service.start_function
+        if start_function is not None and start_function is not _default:
+            skeleton = self.service.skeleton
+
+            def _start():
+                kwargs = {"asynchronous": True}
+                if skeleton:
+                    kwargs["update_listener"] = skeleton
+                return start_function(**kwargs)
+
+            # a completed start phase is reclaimed by the service's regular stop procedure
+            phases.append(LifecyclePhase(name="start", action=_start, rollback=self._stop_service))
+
+        phases.append(
+            LifecyclePhase(
+                name="check",
+                action=lambda: self.service.check(print_error=True),
+            )
+        )
+        return phases
+
+    @property
+    def phases(self) -> list[LifecyclePhase]:
+        if self._phases is None:
+            self._phases = self._build_phases()
+        return self._phases
+
+    def _run_phases(self) -> None:
+        for index, phase in enumerate(self.phases):
+            try:
+                phase.action()
+            except Exception as e:
+                raise _PhaseFailure(index=index, phase=phase.name, error=e) from e
+
+    def _rollback_completed_phases(self, failed_index: int) -> list[str]:
+        """Rolls back completed phases (indices before the failing one) in reverse declaration order."""
+        rolled_back: list[str] = []
+        for phase in reversed(self.phases[:failed_index]):
+            if phase.rollback is None:
+                continue
+            try:
+                phase.rollback()
+            except Exception as e:
+                LOG.error(
+                    "error while rolling back phase '%s' of service %s: %s",
+                    phase.name,
+                    self.service.name(),
+                    e,
+                )
+            rolled_back.append(phase.name)
+        return rolled_back
+
+    def _stop_service(self) -> Any:
+        """Invokes the legacy stop procedure (``Service.stop``) used as start-phase compensation."""
+        return self.service.stop()
+
+    # ------------------------------------------------------------------
+    # lifecycle operations
+    # ------------------------------------------------------------------
+
+    def assemble(self, timeout: float = SERVICE_START_WAIT_TIMEOUT) -> Service:
+        """
+        Returns the running service, or raises the error that caused assembly to fail. Assembly is
+        single-flight: only the first eligible caller executes the assembly phases, all concurrent
+        callers wait on the container and receive the same result.
+        """
+        is_leader = False
+
+        with self.condition:
+            if self.state == ServiceState.STARTING:
+                if not self.condition.wait_for(
+                    lambda: self.state != ServiceState.STARTING, timeout
+                ):
+                    raise TimeoutError(
+                        f"gave up waiting for service {self.service.name()} to start"
+                    )
+
+            if self.state == ServiceState.STOPPING:
+                if not self.condition.wait_for(
+                    lambda: self.state != ServiceState.STOPPING, timeout
+                ):
+                    raise TimeoutError(f"gave up waiting for service {self.service.name()} to stop")
+                # another caller may have already restarted the service after the stop completed
+                if self.state == ServiceState.STARTING:
+                    if not self.condition.wait_for(
+                        lambda: self.state != ServiceState.STARTING, timeout
+                    ):
+                        raise TimeoutError(
+                            f"gave up waiting for service {self.service.name()} to start"
+                        )
+
+            if self.state == ServiceState.RUNNING:
+                return self.service
+            if self.state == ServiceState.DISABLED:
+                raise ServiceDisabled(f"service {self.service.name()} is disabled")
+            if self.state == ServiceState.ERROR:
+                raise self._failure_exception()
+            if self.state in (ServiceState.AVAILABLE, ServiceState.STOPPED):
+                self._transition(ServiceState.STARTING)
+                # a fresh generation: in-flight tickets from a previous (possibly force-stopped)
+                # generation are invalid and the counter starts at zero
+                self._request_generation += 1
+                self.inflight_requests = 0
+                is_leader = True
+            else:
+                raise ServiceStateException(
+                    f"service {self.service.name()} is not ready ({self.state.value}) and could not "
+                    f"be started"
+                )
+
+        if is_leader:
+            try:
+                self._run_phases()
+            except _PhaseFailure as pf:
+                # phases are executed outside the lock; roll back everything that completed, in reverse
+                # declaration order, then settle in the explainable ERROR state.
+                rolled_back = self._rollback_completed_phases(pf.index)
+                call_safe(self.service.lifecycle_hook.on_exception)
+                LOG.error(
+                    "error while starting service %s in phase '%s': %s",
+                    self.service.name(),
+                    pf.phase,
+                    pf.error,
+                )
+                with self.condition:
+                    self._capture_failure(pf.phase, pf.error, rolled_back)
+                    self._transition(ServiceState.ERROR)
+                    self.condition.notify_all()
+                raise pf.error
+            else:
+                with self.condition:
+                    self._transition(ServiceState.RUNNING)
+                    self.condition.notify_all()
+                return self.service
+
+        # concurrent callers re-evaluate the state published by the leader and share its outcome
+        with self.condition:
+            if self.state == ServiceState.RUNNING:
+                return self.service
+            if self.state == ServiceState.DISABLED:
+                raise ServiceDisabled(f"service {self.service.name()} is disabled")
+            if self.state == ServiceState.ERROR:
+                raise self._failure_exception()
+
+        raise ServiceStateException(
+            f"service {self.service.name()} is not ready ({self.state.value}) and could not be started"
+        )
+
+    def retry(self, timeout: float = SERVICE_START_WAIT_TIMEOUT) -> Service:
+        """
+        Explicit retry entry. Only legal from the ``ERROR`` state: clears the captured failure, moves
+        the service back to ``AVAILABLE`` and runs a fresh single-flight assembly. On success the
+        service is ``RUNNING`` again; on failure it settles in a new explainable ``ERROR`` state.
+        """
+        with self.condition:
+            if self.state == ServiceState.RUNNING:
+                return self.service
+            if self.state != ServiceState.ERROR:
+                raise IllegalServiceStateTransition(
+                    self.service.name(), self.state, ServiceState.AVAILABLE
+                )
+            self.errors.clear()
+            self.failure = None
+            self._transition(ServiceState.AVAILABLE)
+            self.condition.notify_all()
+
+        return self.assemble(timeout)
+
+    def deactivate(self) -> None:
+        """
+        Permanently decommissions the service (``DISABLED``). Only legal from a quiescent state
+        (``AVAILABLE``, ``STOPPED`` or ``ERROR``); services that are starting, running or stopping must
+        be stopped first.
+        """
+        with self.condition:
+            if self.state == ServiceState.DISABLED:
+                return
+            if not can_transition(self.state, ServiceState.DISABLED):
+                raise IllegalServiceStateTransition(
+                    self.service.name(), self.state, ServiceState.DISABLED
+                )
+            self._transition(ServiceState.DISABLED)
+            self.condition.notify_all()
 
     def check(self) -> bool:
+        """
+        Health-check path (not part of lazy assembly). Preserves the previous behavior: a failed check
+        puts the service in ``ERROR`` without tearing the backend down; a successful check of an errored
+        service restores ``RUNNING``.
+        """
         try:
             self.service.check(print_error=True)
-            self.state = ServiceState.RUNNING
-            return True
         except Exception as e:
-            self.state = ServiceState.ERROR
-            self.errors.append(e)
             LOG.error("error while checking service %s: %s", self.service.name(), e)
+            with self.condition:
+                if self.state == ServiceState.RUNNING:
+                    self._capture_failure("check", e, [])
+                    self._transition(ServiceState.ERROR)
+                elif self.state == ServiceState.ERROR:
+                    # already failed: refresh the captured error but keep the state
+                    rolled_back = self.failure.rolled_back_phases if self.failure else []
+                    self._capture_failure("check", e, rolled_back)
+                self.condition.notify_all()
             return False
 
-    def stop(self):
+        with self.condition:
+            if self.state == ServiceState.ERROR:
+                self.errors.clear()
+                self.failure = None
+                self._transition(ServiceState.AVAILABLE)
+                self._transition(ServiceState.RUNNING)
+                self.condition.notify_all()
+        return True
+
+    def stop(self, drain_timeout: float = SERVICE_STOP_DRAIN_TIMEOUT) -> ServiceStopResult:
+        """
+        Stops the service after draining in-flight requests. If in-flight requests do not finish within
+        ``drain_timeout``, the service is force-stopped anyway and the number of interrupted requests is
+        recorded in the result.
+        """
+        name = self.service.name()
+
+        with self.condition:
+            # never cut across an in-progress assembly - wait for it and stop the result
+            if self.state == ServiceState.STARTING:
+                if not self.condition.wait_for(
+                    lambda: self.state != ServiceState.STARTING, drain_timeout
+                ):
+                    raise TimeoutError(f"gave up waiting for service {name} to start")
+
+            # serialize concurrent stops: everybody observes the same terminal stop result
+            if self.state == ServiceState.STOPPING:
+                self.condition.wait_for(lambda: self.state != ServiceState.STOPPING, drain_timeout)
+
+            if self.state == ServiceState.STOPPED:
+                return ServiceStopResult(name, ServiceState.STOPPED)
+
+            # nothing was ever started (or a previous attempt already failed/was disabled)
+            if self.state in (
+                ServiceState.AVAILABLE,
+                ServiceState.DISABLED,
+                ServiceState.ERROR,
+            ):
+                return ServiceStopResult(name, self.state)
+
+            if self.state != ServiceState.RUNNING:
+                raise IllegalServiceStateTransition(name, self.state, ServiceState.STOPPING)
+
+            self._transition(ServiceState.STOPPING)
+            # wait for in-flight requests of the current generation to finish
+            drained = self.condition.wait_for(lambda: self.inflight_requests == 0, drain_timeout)
+            interrupted_requests = 0 if drained else self.inflight_requests
+
+        # invoke the (potentially blocking) stop function without holding the lock
+        error = None
         try:
-            self.state = ServiceState.STOPPING
             self.service.stop()
-            self.state = ServiceState.STOPPED
         except Exception as e:
-            self.state = ServiceState.ERROR
-            self.errors.append(e)
+            error = e
+            LOG.error("error while stopping service %s: %s", name, e)
+
+        with self.condition:
+            # invalidate tickets of requests still in flight after (possibly forced) shutdown, so that
+            # late end_request calls do not leak into the next running generation
+            self._request_generation += 1
+            if error is not None:
+                self._capture_failure("stop", error, [])
+                self._transition(ServiceState.ERROR)
+                result = ServiceStopResult(
+                    name,
+                    ServiceState.ERROR,
+                    interrupted_requests=interrupted_requests,
+                    drained=drained,
+                    error=error,
+                )
+            else:
+                if interrupted_requests:
+                    LOG.warning(
+                        "force-stopped service %s with %d in-flight request(s) still running after "
+                        "%.1fs drain timeout",
+                        name,
+                        interrupted_requests,
+                        drain_timeout,
+                    )
+                self._transition(ServiceState.STOPPED)
+                result = ServiceStopResult(
+                    name,
+                    ServiceState.STOPPED,
+                    interrupted_requests=interrupted_requests,
+                    drained=drained,
+                )
+            self.condition.notify_all()
+
+        return result
+
+    def start(self) -> bool:
+        """Compatibility wrapper around the single-flight ``assemble``."""
+        try:
+            self.assemble()
+            return True
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # in-flight request tracking (used by the request handler chain)
+    # ------------------------------------------------------------------
+
+    def begin_request(self) -> int | None:
+        """
+        Registers an in-flight request. Returns an opaque request-generation ticket, or ``None`` if the
+        service is not currently serving requests (e.g. already stopping/stopped/disabled).
+        """
+        with self.condition:
+            if self.state != ServiceState.RUNNING:
+                return None
+            self.inflight_requests += 1
+            return self._request_generation
+
+    def end_request(self, ticket: int | None) -> None:
+        with self.condition:
+            if ticket is None or ticket != self._request_generation:
+                return
+            if self.inflight_requests > 0:
+                self.inflight_requests -= 1
+            if self.inflight_requests == 0:
+                self.condition.notify_all()
 
 
 class ServiceManager:
@@ -263,8 +750,9 @@ class ServiceManager:
         return self.get_state(name) == ServiceState.RUNNING
 
     def check(self, name: str) -> bool:
-        if self.get_state(name) in [ServiceState.RUNNING, ServiceState.ERROR]:
-            return self.get_service_container(name).check()
+        container = self.get_service_container(name)
+        if container and container.state in [ServiceState.RUNNING, ServiceState.ERROR]:
+            return container.check()
 
     def check_all(self):
         return any(self.check(service_name) for service_name in self.list_available())
@@ -272,6 +760,10 @@ class ServiceManager:
     def get_state(self, name: str) -> ServiceState | None:
         container = self.get_service_container(name)
         return container.state if container else None
+
+    def get_failure(self, name: str) -> ServiceFailure | None:
+        container = self.get_service_container(name)
+        return container.failure if container else None
 
     def get_states(self) -> dict[str, ServiceState]:
         return {name: self.get_state(name) for name in self.list_available()}
@@ -281,41 +773,60 @@ class ServiceManager:
         """
         High level function that always returns a running service, or raises an error. If the service is in a state
         that it could be transitioned into a running state, then invoking this function will attempt that transition,
-        e.g., by starting the service if it is available.
+        e.g., by starting the service if it is available. Concurrent calls for the same service trigger exactly one
+        assembly and share its result. A service in ``ERROR`` raises the captured failure; use ``retry`` to re-enter
+        the assembly, or ``deactivate`` to disable it permanently.
         """
         container = self.get_service_container(name)
 
         if not container:
             raise ValueError(f"no such service {name}")
 
-        if container.state == ServiceState.STARTING:
-            if not poll_condition(lambda: container.state != ServiceState.STARTING, timeout=30):
-                raise TimeoutError(f"gave up waiting for service {name} to start")
+        return container.assemble()
 
-        if container.state == ServiceState.STOPPING:
-            if not poll_condition(lambda: container.state == ServiceState.STOPPED, timeout=30):
-                raise TimeoutError(f"gave up waiting for service {name} to stop")
+    def retry(self, name: str) -> Service:
+        """
+        Explicit retry entry for a failed service. Resets the explainable failure state and re-runs the
+        single-flight assembly. Returns the running service or raises the new captured error.
+        """
+        container = self.get_service_container(name)
 
-        with container.lock:
-            if container.state == ServiceState.DISABLED:
-                raise ServiceDisabled(f"service {name} is disabled")
+        if not container:
+            raise ValueError(f"no such service {name}")
 
-            if container.state == ServiceState.RUNNING:
-                return container.service
+        return container.retry()
 
-            if container.state == ServiceState.ERROR:
-                # raise any capture error
-                raise container.errors[-1]
+    def deactivate(self, name: str) -> None:
+        """
+        Permanently decommissions the service. Legal from ``AVAILABLE``, ``STOPPED`` or ``ERROR``; the
+        service then rejects every ``require`` with ``ServiceDisabled``.
+        """
+        container = self.get_service_container(name)
 
-            if container.state == ServiceState.AVAILABLE or container.state == ServiceState.STOPPED:
-                if container.start():
-                    return container.service
-                else:
-                    raise container.errors[-1]
+        if not container:
+            raise ValueError(f"no such service {name}")
 
-        raise ServiceStateException(
-            f"service {name} is not ready ({container.state}) and could not be started"
-        )
+        container.deactivate()
+
+    def stop_service(
+        self, name: str, drain_timeout: float = SERVICE_STOP_DRAIN_TIMEOUT
+    ) -> ServiceStopResult:
+        """Stops a single service after draining its in-flight requests."""
+        container = self.get_service_container(name)
+
+        if not container:
+            raise ValueError(f"no such service {name}")
+
+        return container.stop(drain_timeout)
+
+    def begin_request(self, name: str) -> int | None:
+        container = self.get_service_container(name)
+        return container.begin_request() if container else None
+
+    def end_request(self, name: str, ticket: int | None) -> None:
+        container = self.get_service_container(name)
+        if container:
+            container.end_request(ticket)
 
     # legacy map compatibility
 
@@ -632,34 +1143,54 @@ class ServicePluginManager(ServiceManager):
                 apis.append(api)
         return apis
 
-    def _stop_services(self, service_containers: list[ServiceContainer]) -> None:
+    def _stop_services(
+        self,
+        service_containers: list[ServiceContainer],
+        drain_timeout: float = SERVICE_STOP_DRAIN_TIMEOUT,
+    ) -> list[ServiceStopResult]:
         """
-        Atomically attempts to stop all given 'ServiceState.STARTING' and 'ServiceState.RUNNING' services.
-        :param service_containers: the list of service containers to be stopped.
-        """
-        target_service_states = {ServiceState.STARTING, ServiceState.RUNNING}
-        with self._mutex:
-            for service_container in service_containers:
-                if service_container.state in target_service_states:
-                    service_container.stop()
+        Stops all given service containers through the common lifecycle state machine. Each stop drains
+        in-flight requests; containers that are not running are skipped by the state machine itself.
 
-    def stop_services(self, services: list[str] = None):
+        :param service_containers: the list of service containers to be stopped.
+        :param drain_timeout: per-service timeout to wait for in-flight requests to finish.
+        :return: the stop results, including the number of interrupted requests per service.
+        """
+        results: list[ServiceStopResult] = []
+        with self._mutex:
+            containers = list(service_containers)
+        for service_container in containers:
+            results.append(service_container.stop(drain_timeout))
+        return results
+
+    def stop_services(
+        self,
+        services: list[str] = None,
+        drain_timeout: float = SERVICE_STOP_DRAIN_TIMEOUT,
+    ) -> list[ServiceStopResult]:
         """
         Stops services for this service manager, if they are currently active.
         Will not stop services not already started or in and error state.
 
         :param services: Service names to stop. If not provided, all services for this manager will be stopped.
+        :param drain_timeout: per-service timeout to wait for in-flight requests to finish.
+        :return: the stop results, including the number of interrupted requests per service.
         """
         target_service_containers = self._get_loaded_service_containers(services=services)
-        self._stop_services(target_service_containers)
+        return self._stop_services(target_service_containers, drain_timeout)
 
-    def stop_all_services(self) -> None:
+    def stop_all_services(
+        self, drain_timeout: float = SERVICE_STOP_DRAIN_TIMEOUT
+    ) -> list[ServiceStopResult]:
         """
         Stops all services for this service manager, if they are currently active.
         Will not stop services not already started or in and error state.
+
+        :param drain_timeout: per-service timeout to wait for in-flight requests to finish.
+        :return: the stop results, including the number of interrupted requests per service.
         """
         target_service_containers = self._get_loaded_service_containers()
-        self._stop_services(target_service_containers)
+        return self._stop_services(target_service_containers, drain_timeout)
 
 
 # map of service plugins, mapping from service name to plugin details

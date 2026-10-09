@@ -3,7 +3,11 @@ from localstack.aws import handlers
 from localstack.aws.api import RequestContext
 from localstack.aws.chain import HandlerChain
 from localstack.aws.handlers.metric_handler import MetricHandler
-from localstack.aws.handlers.service_plugin import ServiceLoader, ServiceLoaderForDataPlane
+from localstack.aws.handlers.service_plugin import (
+    ServiceLoader,
+    ServiceLoaderForDataPlane,
+    ServiceRequestFinalizer,
+)
 from localstack.http.trace import TracingHandlerChain
 from localstack.services.plugins import SERVICE_PLUGINS, ServiceManager, ServicePluginManager
 from localstack.utils.ssl import create_ssl_cert, install_predefined_cert_if_available
@@ -23,6 +27,8 @@ class LocalstackAwsGateway(Gateway):
         # lazy-loads services into the router
         load_service = ServiceLoader(self.service_manager, self.service_request_router)
         load_service_for_data_plane = ServiceLoaderForDataPlane(load_service)
+        # releases per-service in-flight request slots at the end of every request
+        finalize_service_requests = ServiceRequestFinalizer()
 
         metric_collector = MetricHandler()
         # the main request handler chain
@@ -85,6 +91,7 @@ class LocalstackAwsGateway(Gateway):
             [
                 handlers.set_close_connection_header,
                 handlers.run_custom_finalizers,
+                finalize_service_requests,
             ]
         )
 
