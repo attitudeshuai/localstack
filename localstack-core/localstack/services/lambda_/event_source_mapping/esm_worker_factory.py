@@ -2,6 +2,7 @@ from collections.abc import Callable
 
 import botocore.config
 
+from localstack import config
 from localstack.aws.api.lambda_ import (
     EventSourceMappingConfiguration,
     FunctionResponseType,
@@ -19,6 +20,9 @@ from localstack.aws.api.pipes import (
 )
 from localstack.services.lambda_ import hooks as lambda_hooks
 from localstack.services.lambda_ import ldm
+from localstack.services.lambda_.event_source_mapping.checkpointing.registry import (
+    get_stream_checkpoint_registry,
+)
 from localstack.services.lambda_.event_source_mapping.esm_event_processor import (
     EsmEventProcessor,
 )
@@ -38,6 +42,8 @@ from localstack.services.lambda_.event_source_mapping.pollers.sqs_poller import 
     SqsPoller,
 )
 from localstack.services.lambda_.event_source_mapping.senders.lambda_sender import LambdaSender
+from localstack.services.lambda_.invocation.models import lambda_stores
+from localstack.services.lambda_.provider_utils import get_function_version_from_arn
 from localstack.utils.aws.arns import parse_arn
 from localstack.utils.aws.client_types import ServicePrincipal
 
@@ -133,6 +139,19 @@ class EsmWorkerFactory:
 
         filter_criteria = self.esm_config.get("FilterCriteria", {"Filters": []})
         user_state_reason = EsmStateReason.USER_ACTION
+
+        # Opt-in resumable checkpoints and declarative shard ownership for streaming sources.
+        # Backed by the account/region LambdaStore so positions survive worker rebuilds and
+        # process restarts, and are shared (for shard handoff) by all mappings of one stream.
+        stream_checkpointer = None
+        if config.LAMBDA_ESM_STREAM_CHECKPOINTING and source_service in (
+            "kinesis",
+            "dynamodbstreams",
+        ):
+            function_version = get_function_version_from_arn(function_arn)
+            store = lambda_stores[function_version.id.account][function_version.id.region]
+            stream_checkpointer = get_stream_checkpoint_registry(store)
+
         if source_service == "sqs":
             user_state_reason = EsmStateReason.USER_INITIATED
             source_parameters = PipeSourceParameters(
@@ -181,6 +200,7 @@ class EsmWorkerFactory:
                 processor=esm_processor,
                 invoke_identity_arn=self.function_role_arn,
                 kinesis_namespace=True,
+                checkpointer=stream_checkpointer,
             )
         elif source_service == "dynamodbstreams":
             # TODO: map all supported ESM to Pipe parameters
@@ -211,6 +231,7 @@ class EsmWorkerFactory:
                 source_parameters=source_parameters,
                 source_client=source_client,
                 processor=esm_processor,
+                checkpointer=stream_checkpointer,
             )
         else:
             poller_holder = PollerHolder()

@@ -1118,6 +1118,12 @@ LAMBDA_EVENT_SOURCE_MAPPING_MAX_BACKOFF_ON_EMPTY_POLL_SEC = float(
     os.environ.get("LAMBDA_EVENT_SOURCE_MAPPING_MAX_BACKOFF_ON_EMPTY_POLL_SEC") or 10
 )
 
+# INTERNAL: 0 (default)
+# Enables resumable consumption positions (checkpoints) and declarative shard ownership for
+# streaming event source mappings (Kinesis, DynamoDB Streams). When disabled, the in-memory
+# shard iterator behavior is preserved verbatim.
+LAMBDA_ESM_STREAM_CHECKPOINTING = is_env_true("LAMBDA_ESM_STREAM_CHECKPOINTING")
+
 # Specifies the path to the mock configuration file for Step Functions, commonly named MockConfigFile.json.
 SFN_MOCK_CONFIG = os.environ.get("SFN_MOCK_CONFIG", "").strip()
 

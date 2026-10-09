@@ -138,6 +138,11 @@ class EsmWorker:
             self.current_state = EsmState.DELETING
             self.update_esm_state_in_store(EsmState.DELETING)
             self.state_transition_reason = self.user_state_reason
+        # Release declarative shard ownership immediately so that remaining mappings on the
+        # same stream can take over the shards at their last checkpointed position.
+        checkpointer = getattr(self.poller, "checkpointer", None)
+        if checkpointer is not None:
+            checkpointer.release_consumer(self.uuid)
         self._shutdown_event.set()
 
     def poller_loop(self, *args, **kwargs):

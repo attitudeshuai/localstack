@@ -10,6 +10,9 @@ from localstack.aws.api.kinesis import StreamStatus
 from localstack.aws.api.pipes import (
     KinesisStreamStartPosition,
 )
+from localstack.services.lambda_.event_source_mapping.checkpointing.registry import (
+    StreamCheckpointRegistry,
+)
 from localstack.services.lambda_.event_source_mapping.event_processor import (
     EventProcessor,
 )
@@ -38,6 +41,7 @@ class KinesisPoller(StreamPoller):
         kinesis_namespace: bool = False,
         esm_uuid: str | None = None,
         shards: dict[str, str] | None = None,
+        checkpointer: StreamCheckpointRegistry | None = None,
     ):
         super().__init__(
             source_arn,
@@ -47,6 +51,7 @@ class KinesisPoller(StreamPoller):
             esm_uuid=esm_uuid,
             partner_resource_arn=partner_resource_arn,
             shards=shards,
+            checkpointer=checkpointer,
         )
         self.invoke_identity_arn = invoke_identity_arn
         self.kinesis_namespace = kinesis_namespace
@@ -69,26 +74,34 @@ class KinesisPoller(StreamPoller):
 
         # NOTICE: re-sharding might require updating this periodically (unknown how Pipes does it!?)
         # Mapping of shard id => shard iterator
+        all_shard_ids = [shard["ShardId"] for shard in stream_info["StreamDescription"]["Shards"]]
+        self.known_shard_ids = all_shard_ids
         shards = {}
-        for shard in stream_info["StreamDescription"]["Shards"]:
-            shard_id = shard["ShardId"]
-            starting_position = self.stream_parameters["StartingPosition"]
-            kwargs = {}
-            # TODO: test StartingPosition=AT_TIMESTAMP (only supported for Kinesis!)
-            if starting_position == KinesisStreamStartPosition.AT_TIMESTAMP:
-                kwargs["StartingSequenceNumber"] = self.stream_parameters[
-                    "StartingPositionTimestamp"
-                ]
-            get_shard_iterator_response = self.source_client.get_shard_iterator(
-                StreamARN=self.source_arn,
-                ShardId=shard_id,
-                ShardIteratorType=starting_position,
-                **kwargs,
-            )
-            shards[shard_id] = get_shard_iterator_response["ShardIterator"]
+        for shard_id in self._select_owned_shards(all_shard_ids):
+            iterator_ = self._build_shard_iterator(shard_id)
+            if iterator_ is not None:
+                shards[shard_id] = iterator_
 
         LOG.debug("Event source %s has %d shards.", self.source_arn, len(self.shards))
         return shards
+
+    def _build_shard_iterator(self, shard_id: str) -> str | None:
+        starting_position = self.stream_parameters["StartingPosition"]
+        kwargs = {}
+        # TODO: test StartingPosition=AT_TIMESTAMP (only supported for Kinesis!)
+        if starting_position == KinesisStreamStartPosition.AT_TIMESTAMP:
+            kwargs["StartingSequenceNumber"] = self.stream_parameters["StartingPositionTimestamp"]
+        # Resume at the persisted checkpoint, if any; otherwise use StartingPosition.
+        iterator_type, sequence_number = self._resolve_iterator_spec(shard_id, starting_position)
+        if sequence_number is not None:
+            kwargs["StartingSequenceNumber"] = sequence_number
+        get_shard_iterator_response = self.source_client.get_shard_iterator(
+            StreamARN=self.source_arn,
+            ShardId=shard_id,
+            ShardIteratorType=iterator_type,
+            **kwargs,
+        )
+        return get_shard_iterator_response["ShardIterator"]
 
     def stream_arn_param(self) -> dict:
         return {"StreamARN": self.source_arn}

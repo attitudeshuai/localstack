@@ -169,6 +169,9 @@ from localstack.services.lambda_.api_utils import (
     SUBNET_ID_REGEX,
     function_locators_from_arn,
 )
+from localstack.services.lambda_.event_source_mapping.checkpointing.registry import (
+    reset_stream_checkpoint_registries,
+)
 from localstack.services.lambda_.event_source_mapping.esm_config_factory import (
     EsmConfigFactory,
 )
@@ -296,6 +299,8 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
         for esm_worker in self.esm_workers.values():
             esm_worker.stop_for_shutdown()
         self.esm_workers = {}
+        # Drop runtime checkpoint registries (locks); persisted state is reset with the stores.
+        reset_stream_checkpoint_registries()
         self.lambda_service.stop()
 
     def on_after_state_reset(self):

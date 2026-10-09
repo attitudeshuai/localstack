@@ -13,6 +13,10 @@ from botocore.exceptions import ClientError
 from localstack.aws.api.pipes import (
     OnPartialBatchItemFailureStreams,
 )
+from localstack.services.lambda_.event_source_mapping.checkpointing.registry import (
+    CheckpointError,
+    StreamCheckpointRegistry,
+)
 from localstack.services.lambda_.event_source_mapping.event_processor import (
     BatchFailureError,
     CustomerInvocationError,
@@ -48,6 +52,8 @@ class StreamPoller(Poller):
     # Mapping of shard id => shard iterator
     # TODO: This mapping approach needs to be re-worked to instead store last processed sequence number.
     shards: dict[str, str]
+    # All shard ids discovered at the source (independent of ownership when checkpointing is enabled)
+    known_shard_ids: list[str]
     # Iterator for round-robin polling from different shards because a batch cannot contain events from different shards
     # This is a workaround for not handling shards in parallel.
     iterator_over_shards: Iterator[tuple[str, str]] | None
@@ -63,6 +69,10 @@ class StreamPoller(Poller):
     # Collects and flushes a batch of records based on a batching policy
     shard_batcher: dict[str, Batcher[dict]]
 
+    # Optional resumable checkpoint/shard-ownership registry. When ``None`` (default), the
+    # legacy in-memory shard iterator behavior is preserved verbatim.
+    checkpointer: StreamCheckpointRegistry | None
+
     def __init__(
         self,
         source_arn: str,
@@ -72,12 +82,15 @@ class StreamPoller(Poller):
         partner_resource_arn: str | None = None,
         esm_uuid: str | None = None,
         shards: dict[str, str] | None = None,
+        checkpointer: StreamCheckpointRegistry | None = None,
     ):
         super().__init__(source_arn, source_parameters, source_client, processor)
         self.partner_resource_arn = partner_resource_arn
         self.esm_uuid = esm_uuid
         self.shards = shards if shards is not None else {}
+        self.known_shard_ids = []
         self.iterator_over_shards = None
+        self.checkpointer = checkpointer
 
         self._is_shutdown = threading.Event()
 
@@ -108,6 +121,12 @@ class StreamPoller(Poller):
         pass
 
     @abstractmethod
+    def _build_shard_iterator(self, shard_id: str) -> str | None:
+        """Creates a shard iterator for a single shard, honoring both the configured starting
+        position and the persisted checkpoint (if checkpointing is enabled)."""
+        pass
+
+    @abstractmethod
     def stream_arn_param(self) -> dict:
         """Returns a dict of the correct key/value pair for the stream arn used in GetRecords.
         Either StreamARN for Kinesis or {} for DynamoDB (unsupported)"""
@@ -130,6 +149,25 @@ class StreamPoller(Poller):
     def get_sequence_number(self, record: dict) -> str:
         pass
 
+    def _select_owned_shards(self, shard_ids: list[str]) -> list[str]:
+        """Returns the subset of shards this poller's mapping currently owns. With checkpointing
+        disabled every shard is returned unchanged."""
+        if self.checkpointer is None:
+            return shard_ids
+        owned = self.checkpointer.reconcile(self.source_arn, shard_ids, self.esm_uuid)
+        return [shard_id for shard_id in shard_ids if shard_id in owned]
+
+    def _resolve_iterator_spec(
+        self, shard_id: str, default_iterator_type: str
+    ) -> tuple[str, str | None]:
+        """Resolves the shard iterator type and sequence number parameter from the persisted
+        checkpoint. Returns ``(default_iterator_type, None)`` when there is no checkpoint or
+        checkpointing is disabled, leaving the configured StartingPosition untouched."""
+        if self.checkpointer is None:
+            return default_iterator_type, None
+        iterator_type, sequence_number = self.checkpointer.iterator_spec(self.source_arn, shard_id)
+        return iterator_type or default_iterator_type, sequence_number
+
     def close(self):
         self._is_shutdown.set()
 
@@ -147,6 +185,9 @@ class StreamPoller(Poller):
         Examples of DynamoDB consumers:
         * Blogpost: https://www.tecracer.com/blog/2022/05/getting-a-near-real-time-view-of-a-dynamodb-stream-with-python.html
         """
+        if self.checkpointer is not None:
+            self._poll_events_checkpointed()
+            return
         # TODO: consider potential shard iterator timeout after 300 seconds (likely not relevant with short-polling):
         #   https://docs.aws.amazon.com/streams/latest/dev/troubleshooting-consumers.html#shard-iterator-expires-unexpectedly
         #  Does this happen if no records are received for 300 seconds?
@@ -184,13 +225,118 @@ class StreamPoller(Poller):
             # Ignore and wait for the next polling interval, which will do retry
             pass
 
+    def _poll_events_checkpointed(self):
+        """Poll loop variant with resumable checkpoints and declarative shard ownership.
+
+        Ownership is reconciled every cycle over the shards discovered at the source. A shard
+        whose ownership changed is dropped locally (including its buffered, undelivered
+        records) and its iterator is rebuilt from the persisted checkpoint, so worker rebuilds
+        and mapping handoffs resume at the exact next record.
+        """
+        if not self.shards:
+            self.shards = self.initialize_shards()
+
+        # Refresh the declarative ownership view (cheap, in-memory).
+        owned_shard_ids = self.checkpointer.reconcile(
+            self.source_arn, self.known_shard_ids, self.esm_uuid
+        )
+        current_shard_ids = set(self.shards.keys())
+        lost_shard_ids = current_shard_ids - owned_shard_ids
+        gained_shard_ids = owned_shard_ids - current_shard_ids
+        ownership_changed = bool(lost_shard_ids or gained_shard_ids)
+
+        # Drop lost shards locally: buffered records sit after the checkpoint and are re-read
+        # by the new owner. Build iterators only for newly gained shards from the persisted
+        # checkpoint; iterators of shards already owned must not be rebuilt (their batchers may
+        # hold records already fetched but not yet flushed).
+        for shard_id in lost_shard_ids:
+            self.shards.pop(shard_id, None)
+            self.shard_batcher.pop(shard_id, None)
+        for shard_id in gained_shard_ids:
+            iterator_ = self._build_shard_iterator(shard_id)
+            if iterator_ is not None:
+                self.shards[shard_id] = iterator_
+        if ownership_changed:
+            self.iterator_over_shards = None
+
+        if not self.shards:
+            LOG.debug("No owned shards for mapping %s on %s.", self.esm_uuid, self.source_arn)
+            raise EmptyPollResultsException(service=self.event_source(), source_arn=self.source_arn)
+
+        # Remove all shard batchers without corresponding owned shards
+        for shard_id in self.shard_batcher.keys() - self.shards.keys():
+            self.shard_batcher.pop(shard_id, None)
+
+        if self.iterator_over_shards is None:
+            self.iterator_over_shards = iter(self.shards.items())
+
+        current_shard_tuple = next(self.iterator_over_shards, None)
+        if not current_shard_tuple:
+            self.iterator_over_shards = iter(self.shards.items())
+            current_shard_tuple = next(self.iterator_over_shards, None)
+
+        if not current_shard_tuple:
+            raise PipeInternalError(
+                "Failed to retrieve any shards for stream polling despite initialization."
+            )
+
+        try:
+            self.poll_events_from_shard(*current_shard_tuple)
+        except PipeInternalError:
+            # Ignore and wait for the next polling interval, which will do retry
+            pass
+
     def poll_events_from_shard(self, shard_id: str, shard_iterator: str):
+        if self.checkpointer is not None:
+            # Delivery and position updates are mutually exclusive: fetch + delivery +
+            # checkpoint commit for a shard all happen under the same shard lock. Handoff
+            # boundaries are observed here as well.
+            with self.checkpointer.shard_lock(self.source_arn, shard_id):
+                if not self.checkpointer.begin_processing(self.source_arn, self.esm_uuid, shard_id):
+                    # Ownership lost at a clean boundary. Buffered records sit after the
+                    # checkpoint and are re-read by the new owner; drop local state.
+                    LOG.debug(
+                        "Mapping %s no longer owns shard %s of %s; suspending polling.",
+                        self.esm_uuid,
+                        shard_id,
+                        self.source_arn,
+                    )
+                    self.shards.pop(shard_id, None)
+                    self.shard_batcher.pop(shard_id, None)
+                    self.iterator_over_shards = None
+                    return
+                self._poll_events_from_shard_locked(shard_id, shard_iterator)
+        else:
+            self._poll_events_from_shard_locked(shard_id, shard_iterator)
+
+    def _poll_events_from_shard_locked(self, shard_id: str, shard_iterator: str):
         get_records_response = self.get_records(shard_iterator)
         records: list[dict] = get_records_response.get("Records", [])
         if not (next_shard_iterator := get_records_response.get("NextShardIterator")):
             # If the next shard iterator is None, we can assume the shard is closed or
             # has expired on the DynamoDB Local server, hence we should re-initialize.
-            self.shards = self.initialize_shards()
+            if self.checkpointer is not None:
+                # Rebuild only this shard's iterator from the checkpoint so that records
+                # buffered in other shards' batchers are not re-read. Fall back to a full
+                # re-initialization (e.g. resharding) when the shard cannot be rebuilt alone.
+                try:
+                    rebuilt_iterator = self._build_shard_iterator(shard_id)
+                except Exception:
+                    LOG.debug(
+                        "Failed to rebuild iterator for shard %s of %s; re-initializing all shards",
+                        shard_id,
+                        self.source_arn,
+                        exc_info=LOG.isEnabledFor(logging.DEBUG),
+                    )
+                    self._reinitialize_shards()
+                else:
+                    if rebuilt_iterator is not None:
+                        self.shards[shard_id] = rebuilt_iterator
+                    else:
+                        self.shards.pop(shard_id, None)
+                        self.shard_batcher.pop(shard_id, None)
+            else:
+                self.shards = self.initialize_shards()
         else:
             # We should always be storing the next_shard_iterator value, otherwise we risk an iterator expiring
             # and all records being re-processed.
@@ -235,6 +381,9 @@ class StreamPoller(Poller):
         # TODO: implement MaximumBatchingWindowInSeconds flush condition (before or after filter?)
         # Don't trigger upon empty events
         if len(matching_events_post_filter) == 0:
+            # No records will be delivered; advance the checkpoint past them anyway so that a
+            # rebuild/restart does not re-read the same filtered-out segment forever.
+            self._checkpoint_commit(shard_id, self.get_sequence_number(polled_events[-1]))
             return
 
         events = self.add_source_metadata(matching_events_post_filter)
@@ -274,6 +423,9 @@ class StreamPoller(Poller):
 
                 self.processor.process_events_batch(events)
                 boff.reset()
+                # Checkpoint only after the batch has been fully delivered, so the persisted
+                # position never points past an in-flight or failed batch.
+                self._checkpoint_commit(shard_id, self.get_sequence_number(events[-1]))
                 # We may need to send on data to a DLQ so break the processing loop and proceed if invocation successful.
                 break
             except PartialBatchFailureError as ex:
@@ -303,6 +455,13 @@ class StreamPoller(Poller):
 
                 # If None is returned, consider the entire batch a failure.
                 if failed_sequence_ids is None:
+                    self._checkpoint_rollback(
+                        shard_id,
+                        self.get_sequence_number(events[0]),
+                        attempts=attempts + 1,
+                        error=error_payload,
+                        reason="ReportBatchItemFailures",
+                    )
                     continue
 
                 # This shouldn't be possible since a PartialBatchFailureError was raised
@@ -313,10 +472,26 @@ class StreamPoller(Poller):
 
                 lowest_sequence_id: str = min(failed_sequence_ids, key=int)
 
+                # Roll the persisted position back to the failed record so a crash or worker
+                # rebuild redelivers starting at it, then discard successful events in memory.
+                self._checkpoint_rollback(
+                    shard_id,
+                    lowest_sequence_id,
+                    attempts=attempts + 1,
+                    error=error_payload,
+                    reason="ReportBatchItemFailures",
+                )
                 # Discard all successful events and re-process from sequence number of failed event
                 _, events = self.bisect_events(lowest_sequence_id, events)
             except BatchFailureError as ex:
                 error_payload = ex.error
+                self._checkpoint_rollback(
+                    shard_id,
+                    self.get_sequence_number(events[0]),
+                    attempts=attempts + 1,
+                    error=error_payload,
+                    reason="FunctionError",
+                )
 
                 # FIXME partner_resource_arn is not defined in ESM
                 LOG.debug(
@@ -327,6 +502,12 @@ class StreamPoller(Poller):
                     exc_info=LOG.isEnabledFor(logging.DEBUG),
                 )
             except Exception:
+                self._checkpoint_rollback(
+                    shard_id,
+                    self.get_sequence_number(events[0]),
+                    attempts=attempts + 1,
+                    reason="InternalError",
+                )
                 # FIXME partner_resource_arn is not defined in ESM
                 LOG.error(
                     "Attempt %d failed with unexpected error while processing %s with events: %s",
@@ -353,6 +534,96 @@ class StreamPoller(Poller):
                 partner_resource_arn=self.partner_resource_arn,
             )
             self.send_events_to_dlq(shard_id, events, context=failure_context)
+            # Record the final abandonment and advance the checkpoint past the abandoned
+            # segment, so retries/abandonment are queryable and consumption leaves no gap.
+            self._checkpoint_abandon(
+                shard_id,
+                last_sequence_number=self.get_sequence_number(events[-1]),
+                reason=abort_condition,
+                attempts=attempts,
+                error=error_payload or None,
+            )
+
+    def _checkpoint_commit(self, shard_id: str, sequence_number: str) -> None:
+        if self.checkpointer is None:
+            return
+        try:
+            self.checkpointer.commit(self.source_arn, self.esm_uuid, shard_id, sequence_number)
+        except CheckpointError:
+            LOG.warning(
+                "Failed to commit checkpoint on shard %s of %s at sequence %s",
+                shard_id,
+                self.source_arn,
+                sequence_number,
+                exc_info=LOG.isEnabledFor(logging.DEBUG),
+            )
+
+    def _checkpoint_rollback(
+        self,
+        shard_id: str,
+        failed_sequence_number: str,
+        attempts: int,
+        reason: str,
+        error: dict | None = None,
+    ) -> None:
+        if self.checkpointer is None:
+            return
+        try:
+            self.checkpointer.rollback(
+                self.source_arn,
+                self.esm_uuid,
+                shard_id,
+                failed_sequence_number=failed_sequence_number,
+                attempts=attempts,
+                error=error,
+                reason=reason,
+            )
+        except CheckpointError:
+            LOG.warning(
+                "Failed to roll back checkpoint on shard %s of %s to sequence %s",
+                shard_id,
+                self.source_arn,
+                failed_sequence_number,
+                exc_info=LOG.isEnabledFor(logging.DEBUG),
+            )
+
+    def _checkpoint_abandon(
+        self,
+        shard_id: str,
+        last_sequence_number: str,
+        reason: str,
+        attempts: int,
+        error: dict | None = None,
+    ) -> None:
+        if self.checkpointer is None:
+            return
+        try:
+            self.checkpointer.abandon(
+                self.source_arn,
+                self.esm_uuid,
+                shard_id,
+                last_sequence_number=last_sequence_number,
+                reason=reason,
+                attempts=attempts,
+                error=error,
+            )
+        except CheckpointError:
+            LOG.warning(
+                "Failed to record abandoned checkpoint on shard %s of %s at sequence %s",
+                shard_id,
+                self.source_arn,
+                last_sequence_number,
+                exc_info=LOG.isEnabledFor(logging.DEBUG),
+            )
+
+    def _reinitialize_shards(self) -> None:
+        """Re-creates all shard iterators. With checkpointing enabled, iterators resume at the
+        persisted position and buffered (not yet delivered) records must be discarded to avoid
+        delivering them twice. Without checkpointing the legacy behavior is preserved."""
+        self.shards = self.initialize_shards()
+        if self.checkpointer is not None:
+            self.shard_batcher.clear()
+            self.iterator_over_shards = None
 
     def get_records(self, shard_iterator: str) -> dict:
         """Returns a GetRecordsOutput from the GetRecords endpoint of streaming services such as Kinesis or DynamoDB"""
@@ -374,7 +645,7 @@ class StreamPoller(Poller):
             )
             # TODO: test TRIM_HORIZON and AT_TIMESTAMP scenarios for this case. We don't want to start from scratch and
             #  might need to think about checkpointing here.
-            self.shards = self.initialize_shards()
+            self._reinitialize_shards()
             raise PipeInternalError from e
         except ClientError as e:
             if "AccessDeniedException" in str(e):
@@ -391,7 +662,7 @@ class StreamPoller(Poller):
                         "Invalid ShardId in ShardIterator for %s. Re-initializing shards.",
                         self.source_arn,
                     )
-                    self.shards = self.initialize_shards()
+                    self._reinitialize_shards()
                 else:
                     LOG.warning(
                         "Source stream %s does not exist: %s",
@@ -405,7 +676,7 @@ class StreamPoller(Poller):
                     shard_iterator,
                     self.source_arn,
                 )
-                self.shards = self.initialize_shards()
+                self._reinitialize_shards()
             else:
                 LOG.debug("ClientError during get_records for stream %s: %s", self.source_arn, e)
             raise PipeInternalError from e

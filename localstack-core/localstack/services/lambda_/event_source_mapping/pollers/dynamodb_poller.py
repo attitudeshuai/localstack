@@ -4,6 +4,9 @@ from datetime import datetime
 from botocore.client import BaseClient
 
 from localstack.aws.api.dynamodbstreams import StreamStatus
+from localstack.services.lambda_.event_source_mapping.checkpointing.registry import (
+    StreamCheckpointRegistry,
+)
 from localstack.services.lambda_.event_source_mapping.event_processor import (
     EventProcessor,
 )
@@ -23,6 +26,7 @@ class DynamoDBPoller(StreamPoller):
         partner_resource_arn: str | None = None,
         esm_uuid: str | None = None,
         shards: dict[str, str] | None = None,
+        checkpointer: StreamCheckpointRegistry | None = None,
     ):
         super().__init__(
             source_arn,
@@ -32,6 +36,7 @@ class DynamoDBPoller(StreamPoller):
             esm_uuid=esm_uuid,
             partner_resource_arn=partner_resource_arn,
             shards=shards,
+            checkpointer=checkpointer,
         )
 
     @property
@@ -52,21 +57,31 @@ class DynamoDBPoller(StreamPoller):
 
         # NOTICE: re-sharding might require updating this periodically (unknown how Pipes does it!?)
         # Mapping of shard id => shard iterator
+        all_shard_ids = [shard["ShardId"] for shard in stream_info["StreamDescription"]["Shards"]]
+        self.known_shard_ids = all_shard_ids
         shards = {}
-        for shard in stream_info["StreamDescription"]["Shards"]:
-            shard_id = shard["ShardId"]
-            starting_position = self.stream_parameters["StartingPosition"]
-            kwargs = {}
-            get_shard_iterator_response = self.source_client.get_shard_iterator(
-                StreamArn=self.source_arn,
-                ShardId=shard_id,
-                ShardIteratorType=starting_position,
-                **kwargs,
-            )
-            shards[shard_id] = get_shard_iterator_response["ShardIterator"]
+        for shard_id in self._select_owned_shards(all_shard_ids):
+            iterator_ = self._build_shard_iterator(shard_id)
+            if iterator_ is not None:
+                shards[shard_id] = iterator_
 
         LOG.debug("Event source %s has %d shards.", self.source_arn, len(self.shards))
         return shards
+
+    def _build_shard_iterator(self, shard_id: str) -> str | None:
+        starting_position = self.stream_parameters["StartingPosition"]
+        kwargs = {}
+        # Resume at the persisted checkpoint, if any; otherwise use StartingPosition.
+        iterator_type, sequence_number = self._resolve_iterator_spec(shard_id, starting_position)
+        if sequence_number is not None:
+            kwargs["SequenceNumber"] = sequence_number
+        get_shard_iterator_response = self.source_client.get_shard_iterator(
+            StreamArn=self.source_arn,
+            ShardId=shard_id,
+            ShardIteratorType=iterator_type,
+            **kwargs,
+        )
+        return get_shard_iterator_response["ShardIterator"]
 
     def stream_arn_param(self) -> dict:
         # Not supported for GetRecords:

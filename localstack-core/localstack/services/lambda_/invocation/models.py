@@ -16,6 +16,12 @@ class LambdaStore(BaseStore):
     # maps EventSourceMapping UUIDs to the respective EventSourceMapping
     event_source_mappings: dict[str, EventSourceMappingConfiguration] = LocalAttribute(default=dict)
 
+    # maps streaming event source ARNs (e.g. Kinesis/DynamoDB Streams) to their resumable
+    # consumption state: per-shard checkpoints, ownership leases and delivery results.
+    # Plain nested dicts so that the state survives state reset snapshots and process restarts.
+    # See localstack.services.lambda_.event_source_mapping.checkpointing.registry
+    event_source_stream_state: dict[str, dict] = LocalAttribute(default=dict)
+
     # maps CodeSigningConfig ARNs to the respective CodeSigningConfig
     code_signing_configs: dict[str, CodeSigningConfig] = LocalAttribute(default=dict)
 
