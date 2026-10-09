@@ -1,6 +1,7 @@
 import functools
 from collections.abc import Callable
 from typing import (
+    TYPE_CHECKING,
     Any,
     NamedTuple,
     ParamSpec,
@@ -8,6 +9,9 @@ from typing import (
     TypedDict,
     TypeVar,
 )
+
+if TYPE_CHECKING:
+    from localstack.aws.budget import ExecutionBudget
 
 from botocore.model import OperationModel, ServiceModel
 from rolo.gateway import RequestContext as RoloRequestContext
@@ -111,9 +115,12 @@ class RequestContext(RoloRequestContext):
     """Data sent by client-side LocalStack during internal calls."""
     trace_context: dict[str, Any]
     """Tracing metadata such as X-Ray trace headers"""
+    budget: "ExecutionBudget | None"
+    """The request-level execution budget enforced for this request, or None if budgeting is disabled"""
 
     def __init__(self, request: Request):
         super().__init__(request)
+        self.budget = None
         self.service = None
         self.protocol = None
         self.operation = None

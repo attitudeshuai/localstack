@@ -1,6 +1,7 @@
 from localstack import config
 from localstack.aws import handlers
 from localstack.aws.api import RequestContext
+from localstack.aws.budget import BudgetExemptionHandler, BudgetExhaustedHandler, BudgetHandlerChain
 from localstack.aws.chain import HandlerChain
 from localstack.aws.handlers.metric_handler import MetricHandler
 from localstack.aws.handlers.service_plugin import ServiceLoader, ServiceLoaderForDataPlane
@@ -11,6 +12,10 @@ from localstack.utils.ssl import create_ssl_cert, install_predefined_cert_if_ava
 from .gateway import Gateway
 from .handlers.fallback import EmptyResponseHandler
 from .handlers.service import ServiceRequestRouter
+
+
+class BudgetTracingHandlerChain(BudgetHandlerChain, TracingHandlerChain):
+    """Handler chain combining request budget enforcement with DEBUG_HANDLER_CHAIN tracing."""
 
 
 class LocalstackAwsGateway(Gateway):
@@ -25,6 +30,9 @@ class LocalstackAwsGateway(Gateway):
         load_service_for_data_plane = ServiceLoaderForDataPlane(load_service)
 
         metric_collector = MetricHandler()
+        # request-level execution budget enforcement
+        budget_exemption = BudgetExemptionHandler()
+        handle_budget_exhausted = BudgetExhaustedHandler()
         # the main request handler chain
         self.request_handlers.extend(
             [
@@ -47,6 +55,8 @@ class LocalstackAwsGateway(Gateway):
                 handlers.add_account_id,
                 handlers.parse_trace_context,
                 handlers.parse_service_request,
+                # now that the AWS operation is known, apply budget exemptions (long poll/streaming)
+                budget_exemption,
                 metric_collector.record_parsed_request,
                 handlers.serve_custom_service_request_handlers,
                 load_service,  # once we have the service request we can make sure we load the service
@@ -60,6 +70,7 @@ class LocalstackAwsGateway(Gateway):
         self.exception_handlers.extend(
             [
                 handlers.log_exception,
+                handle_budget_exhausted,
                 handlers.serve_custom_exception_handlers,
                 handlers.handle_service_exception,
                 handlers.handle_internal_failure,
@@ -90,7 +101,7 @@ class LocalstackAwsGateway(Gateway):
 
     def new_chain(self) -> HandlerChain:
         if config.DEBUG_HANDLER_CHAIN:
-            return TracingHandlerChain(
+            return BudgetTracingHandlerChain(
                 self.request_handlers,
                 self.response_handlers,
                 self.finalizers,

@@ -5,7 +5,7 @@ import time
 from contextvars import copy_context
 
 from .run import FuncThread
-from .threads import TMP_THREADS, start_worker_thread
+from .threads import TMP_THREADS, bind_callable_to_request_budget, start_worker_thread
 
 # reference to named event loop instances
 EVENT_LOOPS = {}
@@ -43,15 +43,23 @@ class AdaptiveThreadPool(DaemonAwareThreadPool):
         super().__init__(max_workers=self.core_size)
 
     def submit(self, fn, *args, **kwargs):
+        # bind work spawned during a budgeted request to the request budget: the budget context
+        # is propagated into the worker and the future is cancelled if the budget is exhausted
+        fn, args, kwargs, budget = bind_callable_to_request_budget(fn, args, kwargs)
+
         # if idle threads are available, don't spin new threads
         if self.has_idle_threads():
-            return super().submit(fn, *args, **kwargs)
+            future = super().submit(fn, *args, **kwargs)
+        else:
 
-        def _run(*tmpargs):
-            return fn(*args, **kwargs)
+            def _run(*tmpargs):
+                return fn(*args, **kwargs)
 
-        thread = start_worker_thread(_run)
-        return thread.result_future
+            future = start_worker_thread(_run).result_future
+
+        if budget is not None:
+            budget.track_future(future)
+        return future
 
     def has_idle_threads(self):
         if hasattr(self, "_idle_semaphore"):

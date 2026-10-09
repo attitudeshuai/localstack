@@ -6,7 +6,10 @@ import traceback
 from collections.abc import Callable
 from concurrent.futures import Future
 from multiprocessing.dummy import Pool
-from typing import Any, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
+
+if TYPE_CHECKING:
+    from localstack.aws.budget.core import ExecutionBudget
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -106,16 +109,66 @@ def start_thread(
         LOG.debug("start_thread called without providing a custom name")
     name = name or method.__name__
     thread = FuncThread(method, params=params, quiet=quiet, name=name, on_stop=on_stop)
+    _bind_thread_to_request_budget(thread)
     thread.start()
     if _shutdown_hook:
         TMP_THREADS.append(thread)
     return thread
 
 
+def _current_request_budget() -> "ExecutionBudget | None":
+    try:
+        from localstack.aws.budget.core import current_budget
+
+        return current_budget()
+    except Exception:
+        return None
+
+
+def bind_callable_to_request_budget(
+    method: "Callable[P, T]", args: Any, kwargs: Any
+) -> tuple[Callable[..., T], Any, Any, "ExecutionBudget | None"]:
+    """
+    Bind a callable submitted to a thread pool to the current request execution budget, if any.
+
+    :return: a tuple ``(fn, args, kwargs, budget)`` where ``fn`` propagates the budget context
+        into the worker thread. Without an active budget, everything is returned unchanged.
+    """
+    budget = _current_request_budget()
+    if budget is None:
+        return method, args, kwargs, None
+
+    def _run(*_ignore: Any) -> T:
+        from localstack.aws.budget.core import _current_budget
+
+        token = _current_budget.set(budget)
+        try:
+            return method(*args, **kwargs)
+        finally:
+            _current_budget.reset(token)
+
+    return _run, (), {}, budget
+
+
+def _bind_thread_to_request_budget(thread: "FuncThread") -> None:
+    """
+    Bind a freshly created (not yet started) worker thread to the request execution budget of
+    the current execution context, if any. The budget context is propagated into the thread,
+    and the thread is cooperatively stopped when the budget is exhausted. No-op without a
+    budget, so the historical behavior is preserved otherwise.
+    """
+    budget = _current_request_budget()
+    if budget is not None:
+        budget.bind_worker_thread(thread)
+
+
 def start_worker_thread(
     method: "Callable[P, T]", params: Any = None, name: str | None = None
 ) -> FuncThread:
-    return start_thread(method, params, _shutdown_hook=False, name=name or "start_worker_thread")
+    thread = FuncThread(method, params=params, name=name or "start_worker_thread")
+    _bind_thread_to_request_budget(thread)
+    thread.start()
+    return thread
 
 
 def cleanup_threads_and_processes(quiet: bool = True) -> None:

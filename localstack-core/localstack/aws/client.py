@@ -400,6 +400,16 @@ class GatewayShortCircuit:
         # create request
         context = RequestContext(request=create_http_request(request))
 
+        # nested in-memory internal calls inherit the caller's remaining budget and can never
+        # extend it (they share the deadline and the cancellation state)
+        from localstack.aws.budget import BudgetExhaustedError, current_budget
+
+        parent_budget = current_budget()
+        if parent_budget is not None:
+            # fail fast if the upstream request has already given up
+            parent_budget.check()
+            context.budget = parent_budget.child_for_internal_call()
+
         # TODO: just a hacky thing to unblock the service model being set to `sqs-query` blocking for now
         # this is using the same services as `localstack.aws.protocol.service_router.resolve_conflicts`, maybe
         # consolidate. `docdb` and `neptune` uses the RDS API and service.
@@ -417,6 +427,13 @@ class GatewayShortCircuit:
         # perform request
         response = Response()
         self.gateway.handle(context, response)
+
+        if parent_budget is not None and parent_budget.is_exhausted:
+            # the nested call was (or the shared budget is) exhausted: surface the budget error
+            # to the caller instead of letting the serialized 5xx be parsed as a generic error
+            raise BudgetExhaustedError(
+                parent_budget, parent_budget.exhaustion_reason or "nested-call"
+            )
 
         # transform Werkzeug response to client-side botocore response
         aws_response = awsrequest.AWSResponse(

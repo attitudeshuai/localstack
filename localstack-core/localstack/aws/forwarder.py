@@ -18,6 +18,11 @@ from localstack.aws.api.core import (
     ServiceRequestHandler,
     ServiceResponse,
 )
+from localstack.aws.budget import (
+    BudgetedRequestsClient,
+    current_budget,
+    rewrite_dto_budget_header,
+)
 from localstack.aws.client import create_http_request, parse_response, raise_service_exception
 from localstack.aws.connect import connect_to
 from localstack.aws.skeleton import DispatchTable, create_dispatch_table
@@ -77,7 +82,17 @@ class AwsRequestProxy:
             # if a service request is passed then we need to create a new request context
             context = self.new_request_context(context, service_request)
 
-        http_response = self.proxy.forward(context.request, forward_path=context.request.path)
+        budget = current_budget()
+        if budget is not None and budget.is_live:
+            # bound the blocking backend call by the remaining request budget: a dedicated client
+            # applies the socket timeout without affecting other requests sharing the proxy
+            proxy = Proxy(forward_base_url=self.endpoint_url, client=BudgetedRequestsClient())
+            try:
+                http_response = proxy.forward(context.request, forward_path=context.request.path)
+            finally:
+                proxy.close()
+        else:
+            http_response = self.proxy.forward(context.request, forward_path=context.request.path)
         if not self.parse_response:
             return http_response
         parsed_response = parse_response(
@@ -99,6 +114,8 @@ class AwsRequestProxy:
         headers = Headers(original.request.headers)
         headers.pop("Content-Type", None)
         headers.pop("Content-Length", None)
+        # refresh the propagated remaining budget so the backend cannot inherit a stale value
+        rewrite_dto_budget_header(headers, getattr(original, "budget", None) or current_budget())
         context.request.headers.update(headers)
         return context
 

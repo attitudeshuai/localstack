@@ -154,6 +154,9 @@ class InternalRequestParameters(TypedDict):
     service_principal: str | None
     """Service principal making this call"""
 
+    request_timeout_ms: int | None
+    """Remaining request execution budget in milliseconds propagated to the nested call"""
+
 
 def dump_dto(data: InternalRequestParameters) -> str:
     # To produce a compact JSON representation of DTO, remove spaces from separators
@@ -809,4 +812,9 @@ def _handler_inject_dto_header(params: dict[str, Any], context: dict[str, Any], 
     it as part of the request headers.
     """
     if (dto := context.pop("_localstack", None)) is not None:
+        # propagate the remaining request execution budget (imported lazily to avoid an import
+        # cycle between the connection stack and the budget package)
+        from localstack.aws.budget.propagation import inject_budget_into_dto
+
+        inject_budget_into_dto(dto)
         params["headers"][INTERNAL_REQUEST_PARAMS_HEADER] = dump_dto(dto)

@@ -760,6 +760,33 @@ GATEWAY_WORKER_COUNT = int(os.environ.get("GATEWAY_WORKER_COUNT") or 1000)
 # the gateway server that should be used (supported: hypercorn, twisted dev: werkzeug)
 GATEWAY_SERVER = os.environ.get("GATEWAY_SERVER", "").strip() or "twisted"
 
+# -- Request execution budget -----------------------------------------------------------
+# Per-request processing time budget in seconds. Unset/0 disables budgeting entirely, in which
+# case the gateway behaves exactly as before. Parsing and validation (including the settings
+# below and per-request overrides) is centralized in ``localstack.aws.budget.config``.
+GATEWAY_REQUEST_BUDGET = os.environ.get("GATEWAY_REQUEST_BUDGET", "").strip()
+# Upper bound (seconds) clients may request through the per-request override header
+GATEWAY_REQUEST_BUDGET_MAX = os.environ.get("GATEWAY_REQUEST_BUDGET_MAX", "").strip()
+# Whether external callers may override the budget with the x-localstack-budget-timeout header
+GATEWAY_REQUEST_BUDGET_ALLOW_OVERRIDE = is_env_true("GATEWAY_REQUEST_BUDGET_ALLOW_OVERRIDE")
+# Exhaustion policy: "abort" (abort processing and return a distinguishable failure)
+GATEWAY_REQUEST_BUDGET_POLICY = (
+    os.environ.get("GATEWAY_REQUEST_BUDGET_POLICY", "").strip() or "abort"
+)
+# Declarative exemptions for streaming responses and long polling (enabled by default)
+GATEWAY_REQUEST_BUDGET_EXEMPT_STREAMING = is_env_not_false(
+    "GATEWAY_REQUEST_BUDGET_EXEMPT_STREAMING"
+)
+GATEWAY_REQUEST_BUDGET_EXEMPT_LONG_POLLING = is_env_not_false(
+    "GATEWAY_REQUEST_BUDGET_EXEMPT_LONG_POLLING"
+)
+# Comma-separated list of additional exempt operations, e.g. "sqs:ReceiveMessage,kinesis:GetRecords"
+GATEWAY_REQUEST_BUDGET_EXEMPT_OPERATIONS = os.environ.get(
+    "GATEWAY_REQUEST_BUDGET_EXEMPT_OPERATIONS", ""
+).strip()
+# Whether the remaining budget is propagated to internal cross-service calls
+GATEWAY_REQUEST_BUDGET_PROPAGATE = is_env_not_false("GATEWAY_REQUEST_BUDGET_PROPAGATE")
+
 # IP of the docker bridge used to enable access between containers
 DOCKER_BRIDGE_IP = os.environ.get("DOCKER_BRIDGE_IP", "").strip()
 
